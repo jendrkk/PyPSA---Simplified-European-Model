@@ -25,7 +25,22 @@ from scipy.spatial import Voronoi
 import numpy as np
 
 # Add src to path for data_prep import
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
+def find_repo_root(start_path: Path, max_up: int = 6) -> Path:
+    """Find repository root by searching upward for README.md or .git"""
+    p = start_path.resolve()
+    for _ in range(max_up):
+        if (p / 'README.md').exists() or (p / '.git').exists():
+            return p
+        if p.parent == p:
+            break
+        p = p.parent
+    return start_path.resolve()
+
+repo_root = find_repo_root(Path(__file__).parent)
+src_path = repo_root / 'src'
+if str(src_path) not in sys.path:
+    sys.path.insert(1, str(src_path))
+
 try:
     from pypsa_simplified import data_prep
 except ImportError:
@@ -889,8 +904,8 @@ if __name__ == "__main__":
         # Try to load buses
         osm_dir = Path(__file__).parent.parent / "data" / "raw" / "OSM Prebuilt Electricity Network"
         if osm_dir.exists():
-            data_dict = pd.prepare_osm_source(osm_dir)
-            raw_data = pd.RawData(data_dict)
+            data_dict = prepare_osm_source(osm_dir)
+            raw_data = RawData(data_dict)
             
             if raw_data.data.get('buses') is not None:
                 # Create Voronoi for EU27

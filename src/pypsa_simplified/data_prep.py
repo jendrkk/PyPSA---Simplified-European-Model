@@ -109,7 +109,7 @@ class RawData:
             with gzip.open(input_path, "rb") as f:
                 data = pickle.load(f)
         self.data = data
-        return data)
+        return data
     
 def _read_csv_if_exists(path: Path, special_handling: bool = True) -> pd.DataFrame | None:
     if not path.exists():
