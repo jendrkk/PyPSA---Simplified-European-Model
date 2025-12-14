@@ -899,13 +899,13 @@ if __name__ == "__main__":
     # 3. Try to load buses and create Voronoi diagrams
     print("Step 3/4: Creating Voronoi diagrams for EU27 buses...")
     try:
-        import data_prep as dp
+        import pypsa_simplified.data_prep as dp
         
         # Try to load buses
         osm_dir = Path(__file__).parent.parent / "data" / "raw" / "OSM Prebuilt Electricity Network"
         if osm_dir.exists():
-            data_dict = prepare_osm_source(osm_dir)
-            raw_data = RawData(data_dict)
+            data_dict = dp.prepare_osm_source(osm_dir)
+            raw_data = dp.RawData(data_dict)
             
             if raw_data.data.get('buses') is not None:
                 # Create Voronoi for EU27

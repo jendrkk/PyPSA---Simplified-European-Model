@@ -239,3 +239,116 @@ Minimal sanity checks live in `tests/` and can be run with `pytest` (PyPSA requi
 ```bash
 pytest tests/test_io_and_network.py
 ```
+
+## License
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+This repository utilizes the PyPSA package and its documentation as a primary resource. The model aims to serve as a proof of concept for the methods and approaches outlined in the pypsa-eur repository, including its data and methodologies.
+
+## References
+- PyPSA Documentation: [https://pypsa.readthedocs.io/](https://pypsa.readthedocs.io/)
+- pypsa-eur Repository: [https://github.com/PyPSA/pypsa-eur](https://github.com/PyPSA/pypsa-eur)
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.8 or higher
+- pip package manager
+
+### Installation
+
+```bash
+git clone https://github.com/jendrkk/PyPSA---Simplified-European-Model.git
+cd PyPSA---Simplified-European-Model
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+# Optional: install pypsa manually if not pulled by requirements
+pip install pypsa
+```
+
+### Running the refactored pipeline
+
+1) **Local prep (small):**
+```python
+from pathlib import Path
+from pypsa_simplified import prepare_osm_source, serialize_network_source
+
+osm_dir = Path("data/raw/OSM Prebuilt Electricity Network")
+source_pkg = prepare_osm_source(osm_dir)
+artifact = serialize_network_source("data/processed/network_source.pkl.gz", source_pkg)
+```
+
+2) **Transfer + run remotely (heavy):**
+```python
+from pypsa_simplified import SSHConfig, transfer_to_server, run_remote_job, transfer_to_server_pw, run_remote_job_pw
+
+ssh = SSHConfig(host="server", user="me", port=22, identity_file="~/.ssh/id_rsa")
+transfer_to_server(artifact, "~/work/network_source.pkl.gz", ssh)
+remote_cmd = "python -m pypsa_simplified.remote_job --source network_source.pkl.gz --output optimized.nc --snapshot-limit 168"
+run_remote_job(ssh, remote_cmd, remote_workdir="~/work")
+```
+
+If you login with a password and don't have SSH keys, install `paramiko` and use the password helpers:
+
+```python
+pip install paramiko
+
+ssh_pw = SSHConfig(host="server", user="me", port=22, password="YOUR_PASSWORD")
+transfer_to_server_pw(artifact, "~/work/network_source.pkl.gz", ssh_pw)
+run_remote_job_pw(ssh_pw, remote_cmd, remote_workdir="~/work")
+```
+
+3) **Fetch + analyze locally (light):**
+```python
+from pypsa_simplified import fetch_from_server, load_optimized_network, network_summary
+
+fetch_from_server("~/work/optimized.nc", "data/processed/optimized.nc", ssh)
+network = load_optimized_network("data/processed/optimized.nc")
+print(network_summary(network))
+```
+
+### Running on Slurm (optional)
+
+- Copy `network_source.pkl.gz` to the cluster scratch folder.
+- Submit a batch job that calls the CLI: `python -m pypsa_simplified.remote_job --source network_source.pkl.gz --output optimized.nc --snapshot-limit 168`.
+- Adjust the `snapshot-limit` or solver settings via environment variables in your Slurm script; wrap the command in `srun` if needed.
+
+### Data layout
+
+- **`data/raw/OSM Prebuilt Electricity Network/`**: OSM-derived CSVs (buses, lines, links, converters, transformers)
+- **`data/processed/`**: Serialized artifacts for transfer (gitignored)
+
+### Key APIs
+
+- `prepare_osm_source(osm_dir, countries)` → dict with cleaned buses/lines/links
+- `serialize_network_source(path, data)` / `load_serialized_source(path)`
+- `build_network_from_source(data, NetworkOptions)` → PyPSA ``Network``
+- `optimize_network(network, snapshot_slice)` → runs PyPSA optimization
+- `save_optimized_network(path, network)` / `load_optimized_network(path)`
+- `SSHConfig`, `transfer_to_server`, `run_remote_job`, `fetch_from_server`
+- `env_install.ensure_packages()` → conda guidance for servers
+
+### Server dependency helper
+
+```bash
+python -m pypsa_simplified.env_install
+# or inside Python
+from pypsa_simplified import ensure_packages, format_plan
+print(format_plan(ensure_packages()))
+```
+
+If your server uses system Python and conda isn't available, use:
+
+```bash
+pip install pypsa pandas numpy matplotlib paramiko
+```
+
+### Tests
+
+Minimal sanity checks live in `tests/` and can be run with `pytest` (PyPSA required for network test):
+
+```bash
+pytest tests/test_io_and_network.py
+```
