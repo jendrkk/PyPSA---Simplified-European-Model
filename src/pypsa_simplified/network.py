@@ -18,15 +18,25 @@ sys.path.append(os.path.dirname(SCRIPT_DIR))
 from pypsa_simplified import data_prep as dp
 
 G_CARRIERS = {
-    "coal": {
+    "hard coal": {
         "co2_emissions": 0.35,  # tonnes CO2/MWh thermal; ÷ efficiency for electric
-        "nice_name": "Coal",
+        "nice_name": "Hard Coal",
         "color": "#8B7355",
+    },
+    "lignite": {
+        "co2_emissions": 0.41,  # tonnes CO2/MWh thermal; ÷ efficiency for electric
+        "nice_name": "Lignite",
+        "color": "#A0522D",
     },
     "gas": {
         "co2_emissions": 0.20,  # tonnes CO2/MWh thermal
         "nice_name": "Natural Gas",
         "color": "#FF6B6B",
+    },
+    "oil": {
+        "co2_emissions": 0.27,  # tonnes CO2/MWh thermal
+        "nice_name": "Oil",
+        "color": "#D2691E",
     },
     "nuclear": {
         "co2_emissions": 0.0,  # Nuclear has negligible lifecycle emissions
@@ -48,10 +58,30 @@ G_CARRIERS = {
         "nice_name": "Hydro",
         "color": "#4169E1",
     },
+    "geothermal": {
+        "co2_emissions": 0.0,
+        "nice_name": "Geothermal",
+        "color": "#FF4500",
+    },
+    "biogas": {
+        "co2_emissions": 0.0,  # Often considered carbon-neutral in lifecycle assessments
+        "nice_name": "Biogas",
+        "color": "#32CD32",
+    },
     "biomass": {
         "co2_emissions": 0.0,  # Often considered carbon-neutral in lifecycle assessments
-        "nice_name": "Biomass",
+        "nice_name": "Solid Biomass",
         "color": "#228B22",
+    },
+    "waste": {
+        "co2_emissions": 0.0,
+        "nice_name": "Waste to Energy",
+        "color": "#708090",
+    },
+    "other": {
+        "co2_emissions": 0.0,
+        "nice_name": "Other",
+        "color": "#A9A9A9",
     },
 }
 
@@ -375,6 +405,31 @@ def build_network(n: pypsa.Network, data_dict: dp.RawData, options: Dict[str, An
 
     # Additional options (CRS, snapshots, carriers) can be applied here
     return net
+
+def add_generators(n: pypsa.Network, RawData: dp.RawData) -> pypsa.Network:
+    """Add generators from the provided DataFrame into the PyPSA network."""
+    generators_df = RawData.get('generators')
+        
+    RawData.bus_coords()
+        
+    for idx, row in generators_df.iterrows():
+        
+        
+        
+        try:
+            n.add(
+                "Generator",
+                name=row['Name'],
+                bus=row['bus'],
+                p_nom=float(row['p_nom']),
+                carrier=row['carrier'],
+                efficiency=float(row.get('efficiency', 0.4)),
+                marginal_cost=float(row.get('marginal_cost', 50.0)),
+            )
+        except Exception as e:
+            if idx < 3:
+                print(f"Error adding generator {row.get('generator_id', 'unknown')}: {e}")
+    return n
 
 
 def build_network_from_serialized_source(n: pypsa.Network, source_path: str, options: Dict[str, Any] | None = None) -> pypsa.Network:

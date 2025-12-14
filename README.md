@@ -1,12 +1,73 @@
 # Simplified PyPSA-EUR Pipeline (Refactor)
 
-This repository has been refactored to move heavy logic into `src/pypsa_simplified` while keeping notebooks lightweight and explanatory.
+This repository has been refactored to move heavy logic into `src/pypsa_simplified` while keeping notebooks lightweight and explanatory. It now includes a comprehensive **geometry module** for handling European geographical data, Voronoi tessellation, and spatial analysis.
+
 ## Module layout
 - `src/pypsa_simplified/io.py`: Compact serialization of source inputs and NetCDF save/load for networks.
 - `src/pypsa_simplified/network.py`: Build and optimize networks using PyPSA.
+- `src/pypsa_simplified/data_prep.py`: RawData container class for standardized data access.
 - `src/pypsa_simplified/remote.py`: SSH file transfer and remote execution helpers (password prompt supported).
 - `src/pypsa_simplified/env_install.py`: Detect/install required packages on server or print exact conda commands.
 - `src/pypsa_simplified/run_opt.py`: CLI for running optimization on the server.
+- **`scripts/geometry.py`**: European geographical data handling (countries, NUTS-3, Voronoi diagrams).
+- **`scripts/bus_filtering.py`**: Utilities for filtering power network buses by geography.
+
+## Geometry Module
+
+The geometry module provides powerful tools for working with European geographical data:
+
+### Core Features
+1. **Country Boundaries**: Download and cache official European country shapes from Eurostat GISCO
+2. **NUTS-3 Regions**: Access detailed regional data for fine-grained spatial analysis
+3. **Voronoi Diagrams**: Generate Voronoi tessellations for bus locations within country boundaries
+4. **Point-in-Shape Tests**: Fast containment checks for buses and network elements
+5. **Efficient Caching**: GeoParquet format for compressed, fast I/O
+
+### Quick Start
+
+```python
+from scripts.geometry import (
+    download_country_shapes, 
+    download_nuts3_shapes,
+    get_voronoi,
+    EU27
+)
+from pypsa_simplified.data_prep import prepare_osm_source, RawData
+
+# Download shapes
+countries = download_country_shapes(['DE', 'PL', 'FR'])
+nuts3 = download_nuts3_shapes(['DE'])
+
+# Create Voronoi diagram for EU27 buses
+osm_dir = Path("data/raw/OSM Prebuilt Electricity Network")
+raw_data = RawData(prepare_osm_source(osm_dir))
+voronoi_cells, bus_mapping = get_voronoi(raw_data, countries=EU27, join=True)
+
+# voronoi_cells: GeoDataFrame with polygons
+# bus_mapping: DataFrame with bus_id -> cell_id mapping
+```
+
+### Standalone Execution
+
+Run the geometry module directly to download all European data:
+
+```bash
+python scripts/geometry.py
+```
+
+This will:
+- Download all European country boundaries
+- Download all NUTS-3 regions
+- Generate Voronoi diagrams for EU27 buses
+- Save everything efficiently as GeoParquet files
+
+### Documentation
+
+Full documentation is available in [`scripts/docs/`](scripts/docs/):
+- **[README_geometry.md](scripts/docs/README_geometry.md)**: Complete API reference
+- **[GETTING_STARTED.md](scripts/docs/GETTING_STARTED.md)**: Step-by-step tutorial
+- **[QUICK_REFERENCE.md](scripts/docs/QUICK_REFERENCE.md)**: Code snippets and examples
+- **[ARCHITECTURE.md](scripts/docs/ARCHITECTURE.md)**: Design decisions and caching system
 
 ## Notebook workflow
 - `notebooks/01_data_preparation.ipynb`: Prepares `data/processed/source.json.gz`.

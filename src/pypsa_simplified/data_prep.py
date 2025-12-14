@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any, Dict
 
 import pandas as pd
+import numpy as np
 import pickle
 import gzip
 import json
-import os
 
 class RawData:
     """Container for OSM Prebuilt Electricity Network data as DataFrames."""
@@ -44,6 +44,23 @@ class RawData:
             return None
         if 'x' in buses.columns and 'y' in buses.columns:
             return buses[['bus_id', 'x', 'y']]
+        return None
+    
+    def match_bus_id(self, lat: float, lon: float, tol: float = 1e-6) -> str | None:
+        """Find bus_id matching given coordinates within tolerance."""
+        buses = self.data.get("buses", None)
+        if buses is None:
+            return None
+        
+        t = min(len(str(lat).split(".")[1]), 
+                len(str(lon).split(".")[1]), 
+                len(str(np.format_float_positional(tol, trim='-')).split(".")[1])
+                )
+        tol = 10**(-t)
+        
+        for idx, row in buses.iterrows():
+            if abs(row['x'] - x) <= tol and abs(row['y'] - y) <= tol:
+                return row['bus_id']
         return None
     
     def save(self, output_path: str | Path) -> str:
@@ -92,8 +109,7 @@ class RawData:
             with gzip.open(input_path, "rb") as f:
                 data = pickle.load(f)
         self.data = data
-        return data
-        
+        return data)
     
 def _read_csv_if_exists(path: Path, special_handling: bool = True) -> pd.DataFrame | None:
     if not path.exists():
