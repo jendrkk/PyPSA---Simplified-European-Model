@@ -35,7 +35,7 @@ def ensure_packages(packages: List[str] | None = None, env_name: str | None = No
             print(f"conda activate {env_name}")
         print("conda install -c conda-forge " + " ".join(pkgs))
         return
-
+    
     # Create env if specified
     if env_name:
         subprocess.run(["conda", "create", "-n", env_name, "python=3.11", "-y"], check=False)

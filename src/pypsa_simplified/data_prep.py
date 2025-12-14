@@ -88,6 +88,8 @@ class OSMData:
             with gzip.open(input_path, "rb") as f:
                 data = pickle.load(f)
         self.data = data
+        return data
+        
     
 def _read_csv_if_exists(path: Path, special_handling: bool = True) -> pd.DataFrame | None:
     if not path.exists():
@@ -177,6 +179,7 @@ def prepare_osm_source(osm_dir: str | Path) -> Dict[str, object]:
     Returns
     - dict where keys are filenames (without extension) and values are DataFrames or None.
     """
+    
     osm_dir = Path(osm_dir)
     files = [
         "buses.csv",

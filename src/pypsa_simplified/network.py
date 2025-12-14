@@ -14,9 +14,60 @@ import os
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.dirname(SCRIPT_DIR))
 
-import data_prep as dp
+from pypsa_simplified import data_prep as dp
 
-def build_network_from_source(data_dict: dp.OSMData, options: Dict[str, Any] | None = None) -> pypsa.Network:
+G_CARRIERS = {
+    "coal": {
+        "co2_emissions": 0.35,  # tonnes CO2/MWh thermal; ÷ efficiency for electric
+        "nice_name": "Coal",
+        "color": "#8B7355",
+    },
+    "gas": {
+        "co2_emissions": 0.20,  # tonnes CO2/MWh thermal
+        "nice_name": "Natural Gas",
+        "color": "#FF6B6B",
+    },
+    "nuclear": {
+        "co2_emissions": 0.0,  # Nuclear has negligible lifecycle emissions
+        "nice_name": "Nuclear",
+        "color": "#FFD700",
+    },
+    "wind": {
+        "co2_emissions": 0.0,  # Renewables have zero operational emissions
+        "nice_name": "Wind",
+        "color": "#87CEEB",
+    },
+    "solar": {
+        "co2_emissions": 0.0,  # Renewables have zero operational emissions
+        "nice_name": "Solar",
+        "color": "#FFA500",
+    },
+    "hydro": {
+        "co2_emissions": 0.0,
+        "nice_name": "Hydro",
+        "color": "#4169E1",
+    },
+    "biomass": {
+        "co2_emissions": 0.0,  # Often considered carbon-neutral in lifecycle assessments
+        "nice_name": "Biomass",
+        "color": "#228B22",
+    },
+}
+
+T_CARRIERS = {
+    "AC": {
+        "co2_emissions": 0.0,
+        "nice_name": "AC Transmission",
+        "color": "#333333",
+    },
+    "DC": {
+        "co2_emissions": 0.0,
+        "nice_name": "DC Transmission (HVDC)",
+        "color": "#666666",
+    },
+}
+
+def build_network_from_source(n: pypsa.Network,data_dict: dp.OSMData, options: Dict[str, Any] | None = None) -> pypsa.Network:
     """
     Build a `pypsa.Network` from a lightweight source dictionary.
 
@@ -24,19 +75,111 @@ def build_network_from_source(data_dict: dp.OSMData, options: Dict[str, Any] | N
     For now, we load CSVs if paths are provided in `data_dict`.
     """
     net = pypsa.Network()
+    data_dict = data_dict.data
     
     # Example: if data_dict contains paths for core components
-    buses_csv = data_dict.get("buses_csv")
-    lines_csv = data_dict.get("lines_csv")
-    generators_csv = data_dict.get("generators_csv")
-    loads_csv = data_dict.get("loads_csv")
+    buses_csv = data_dict.get("buses")
+    lines_csv = data_dict.get("lines")
+    links_csv = data_dict.get("links")
+    generators_csv = data_dict.get("generators")
+    loads_csv = data_dict.get("loads")
     
-    if options is not None:
+    
+    if options['generation_carriers'] is not None:
+        generation_carriers = options['generation_carriers']
+    else:
+        generation_carriers = G_CARRIERS
+    
+    if options['transmission_carriers'] is not None:
+        transmission_carriers = options['transmission_carriers']
+    else:
+        transmission_carriers = T_CARRIERS
+        
+    all_carriers = {**generation_carriers, **transmission_carriers}
+    
+    for carrier_name, carrier_attrs in all_carriers.items():
+        if carrier_name not in n.carriers.index:
+            n.add(
+                "Carrier",
+                carrier_name,
+                co2_emissions=carrier_attrs.get("co2_emissions", 0.0),
+                nice_name=carrier_attrs.get("nice_name", carrier_name),
+                color=carrier_attrs.get("color", "#CCCCCC"),
+            )
+    
+    if options['countries'] is not None:
         countries = options['countries']
     else:
         countries = set(buses_csv['country'])
     
     buses_csv = buses_csv[buses_csv['country'].isin(countries)]
+    
+    for idx, row in buses_csv.iterrows():
+        voltage_kv = float(row['voltage'])  # Extract actual voltage from OSM data
+        
+        n.add(
+            "Bus",
+            name=row['bus_id'],
+            x=float(row['x']),
+            y=float(row['y']),
+            country=row['country'],
+            v_nom=voltage_kv,  # Use actual voltage level from OSM
+            carrier="AC" if row['dc'] == 'f' else "DC",  # All buses are AC by default; DC buses introduced via converters only
+            under_construction=False if row['under_construction'] == 'f' else True,
+        )
+    
+    bus_ids_subset = set(buses_csv['bus_id'].values)
+
+    lines_subset = lines_csv[
+        (lines_csv['bus0_id'].isin(bus_ids_subset)) & 
+        (lines_csv['bus1_id'].isin(bus_ids_subset))
+    ].copy()
+
+    print(f"Adding {len(lines_subset)} AC transmission lines")
+
+    for idx, row in lines_subset.iterrows():
+        try:
+            # Extract real line parameters from CSV, with fallbacks
+            r_val = float(row.get('r', 0.01)) if pd.notna(row.get('r')) and float(row.get('r', 0)) > 0 else 0.01
+            x_val = float(row.get('x', 0.1)) if pd.notna(row.get('x')) and float(row.get('x', 0)) > 0 else 0.1
+            s_nom_val = float(row.get('s_nom', 1000)) if pd.notna(row.get('s_nom')) else 1000
+            length_val = float(row.get('length', 100)) if pd.notna(row.get('length')) else 100
+            b_val = float(row.get('b', 100)) if pd.notna(row.get('b')) else 100
+            circuits = int(row.get('circuits', 1)) if pd.notna(row.get('circuits')) else 1
+
+            # If all above are default values, then:
+            type = ""
+            if (
+                r_val == 0.01
+                and x_val == 0.1
+                and s_nom_val == 1000
+                and length_val == 100
+                and b_val == 100
+                and circuits == 1
+                and pd.notna(row.get("type"))
+                and str(row.get("type")).strip() != ""
+            ):
+                type = row['type']
+
+            n.add(
+                "Line",
+                type=type,
+                name=row['line_id'],
+                bus0=row['bus0_id'],
+                bus1=row['bus1_id'],
+                x=x_val,
+                r=r_val,
+                b=b_val,
+                s_nom=s_nom_val,
+                length=length_val,
+                num_parallel=circuits,
+                carrier='AC'            # Lines implicitly operate at AC; carrier not a parameter but important for context
+            )
+        except Exception as e:
+            if idx < 3:  # Print first few errors only
+                print(f"Error adding line {row['line_id']}: {e}")
+    
+    
     
     if buses_csv:
         net.import_components_from_csv(buses_csv, components=["Bus"])
@@ -46,6 +189,8 @@ def build_network_from_source(data_dict: dp.OSMData, options: Dict[str, Any] | N
         net.import_components_from_csv(generators_csv, components=["Generator"])
     if loads_csv:
         net.import_components_from_csv(loads_csv, components=["Load"])
+    if links_csv:
+        net.import_components_from_csv(links_csv, components=["Link"])
 
     # Additional options (CRS, snapshots, carriers) can be applied here
     return net

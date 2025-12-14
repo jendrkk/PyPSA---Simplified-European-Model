@@ -3,13 +3,12 @@ IO helpers for serializing sources and PyPSA networks.
 
 Designed to keep payloads compact and reproducible.
 """
-from __future__ import annotations
+#from __future__ import annotations
 import json
 import os
 import gzip
 import pickle
 from typing import Any, Dict
-
 import pypsa
 
 
@@ -57,6 +56,7 @@ def save_optimized_network(output_path: str, network_obj: pypsa.Network) -> str:
     writes NetCDF, otherwise it writes NetCDF with `.nc` appended.
     Returns the written file path.
     """
+    
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     if output_path.endswith(".nc"):
         network_obj.export_to_netcdf(output_path)
