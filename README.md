@@ -1,6 +1,54 @@
+# Simplified PyPSA-EUR Pipeline (Refactor)
+
+This repository has been refactored to move heavy logic into `src/pypsa_simplified` while keeping notebooks lightweight and explanatory.
+## Module layout
+- `src/pypsa_simplified/io.py`: Compact serialization of source inputs and NetCDF save/load for networks.
+- `src/pypsa_simplified/network.py`: Build and optimize networks using PyPSA.
+- `src/pypsa_simplified/remote.py`: SSH file transfer and remote execution helpers (password prompt supported).
+- `src/pypsa_simplified/env_install.py`: Detect/install required packages on server or print exact conda commands.
+- `src/pypsa_simplified/run_opt.py`: CLI for running optimization on the server.
+
+## Notebook workflow
+- `notebooks/01_data_preparation.ipynb`: Prepares `data/processed/source.json.gz`.
+- `notebooks/main.ipynb`: Orchestrates local → server → local pipeline.
+
+## Pipeline usage
+1. Prepare inputs locally:
+	- Open `notebooks/01_data_preparation.ipynb` and run all cells.
+2. Optional local sanity check:
+	- In `notebooks/main.ipynb`, run the "Local quick build" cell to inspect summary.
+3. Transfer + run remotely:
+	- In `notebooks/main.ipynb`, set your SSH config (host, user, port) and run the remote section.
+	- On the server, `run_opt.py` reads `source.json.gz`, builds and optimizes the network, and writes `net.nc`.
+4. Fetch results:
+	- Use the fetch cell in `main.ipynb` to download `net.nc` locally and load for plotting/analysis.
+
+## Server setup
+If conda is available on the server:
+```
+python -m pypsa_simplified.env_install myenv
+conda activate myenv
+```
+If conda is not available, run manually:
+```
+conda create -n myenv python=3.11 -y
+conda activate myenv
+conda install -c conda-forge pypsa pandas numpy matplotlib -y
+```
+
+## Slurm (optional)
+You can adapt `remote.run_remote_job` to submit jobs via Slurm, e.g.:
+```
+sbatch --chdir <remote_dir> --wrap "python -m pypsa_simplified.run_opt --input source.json.gz --output net.nc"
+```
+Then poll for completion and fetch `net.nc`.
+
+## Notes
+- Behavior is preserved; heavy tasks moved into modules. Adjust `build_network_from_source` to mirror your existing CSV import logic precisely.
+- Serialization keeps artifacts compact (gzipped JSON and NetCDF).
 # PyPSA---Simplified-European-Model
 
-A simplified Python package for building and optimizing PyPSA (Python for Power System Analysis) networks, with a focus on European energy system modeling.
+A modular pipeline for building and optimizing simplified PyPSA (Python for Power System Analysis) networks, with a focus on European energy system modeling. Notebooks now remain thin orchestration layers; all heavy lifting lives in reusable modules under `src/pypsa_simplified`.
 
 ## Repository Structure
 
@@ -8,17 +56,22 @@ A simplified Python package for building and optimizing PyPSA (Python for Power 
 PyPSA---Simplified-European-Model/
 ├── src/
 │   └── pypsa_simplified/        # Main Python package
-│       ├── __init__.py          # Package initialization
-│       ├── core.py              # Network building and data loading
-│       ├── optimize.py          # Optimization functions
-│       └── utils.py             # Utility functions
+│       ├── __init__.py
+│       ├── core.py              # Legacy toy network helpers
+│       ├── data_prep.py         # OSM loading, geometry handling, bus mapping
+│       ├── network.py           # PyPSA network build/optimize/summarize
+│       ├── io.py                # Serialization of sources and optimized nets
+│       ├── remote.py            # SSH transfer + remote execution helpers
+│       ├── remote_job.py        # CLI to run heavy optimization on a server
+│       ├── env_install.py       # Conda dependency detection/installation hints
+│       └── utils.py             # JSON and filesystem utilities
 ├── notebooks/                   # Jupyter notebooks for analysis
 │   ├── 01_data_preparation.ipynb
-│   ├── 02_run_optimization.ipynb
-│   └── 03_analysis.ipynb
+│   └── main.ipynb               # High-level orchestration (refactored)
 ├── data/                        # Data directory (gitignored)
 │   ├── raw/                     # Raw input data (not tracked)
 │   └── processed/               # Processed data (not tracked)
+├── tests/                       # Minimal sanity checks
 ├── requirements-dev.txt         # Development dependencies
 └── README.md                    # This file
 ```
@@ -32,141 +85,96 @@ PyPSA---Simplified-European-Model/
 
 ### Installation
 
-1. Clone the repository:
 ```bash
 git clone https://github.com/jendrkk/PyPSA---Simplified-European-Model.git
 cd PyPSA---Simplified-European-Model
-```
-
-2. Create and activate a virtual environment (recommended):
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install development requirements:
-```bash
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
+# Optional: install pypsa manually if not pulled by requirements
+pip install pypsa
 ```
 
-4. (Optional) Install pulp for optimization:
-```bash
-pip install pulp
-```
+### Running the refactored pipeline
 
-### Running the Notebooks
-
-The notebooks are configured to import the package directly from the `src/` directory.
-
-1. Start Jupyter:
-```bash
-jupyter notebook
-```
-
-2. Navigate to the `notebooks/` directory and open:
-   - `01_data_preparation.ipynb` - Load data and build networks
-   - `02_run_optimization.ipynb` - Run optimization on networks
-   - `03_analysis.ipynb` - Analysis guide and tips
-
-### Importing the Package
-
-When working in notebooks or scripts within the repository:
-
+1) **Local prep (small):**
 ```python
-import sys
 from pathlib import Path
+from pypsa_simplified import prepare_osm_source, serialize_network_source
 
-# Add src directory to Python path
-repo_root = Path().absolute()  # Adjust as needed
-src_path = repo_root / "src"
-sys.path.insert(0, str(src_path))
-
-# Now you can import the package
-from pypsa_simplified import build_network, optimize_network, load_csv
+osm_dir = Path("data/raw/OSM Prebuilt Electricity Network")
+source_pkg = prepare_osm_source(osm_dir)
+artifact = serialize_network_source("data/processed/network_source.pkl.gz", source_pkg)
 ```
 
-### Basic Usage
+2) **Transfer + run remotely (heavy):**
+```python
+from pypsa_simplified import SSHConfig, transfer_to_server, run_remote_job, transfer_to_server_pw, run_remote_job_pw
+
+ssh = SSHConfig(host="server", user="me", port=22, identity_file="~/.ssh/id_rsa")
+transfer_to_server(artifact, "~/work/network_source.pkl.gz", ssh)
+remote_cmd = "python -m pypsa_simplified.remote_job --source network_source.pkl.gz --output optimized.nc --snapshot-limit 168"
+run_remote_job(ssh, remote_cmd, remote_workdir="~/work")
+```
+
+If you login with a password and don't have SSH keys, install `paramiko` and use the password helpers:
 
 ```python
-from pypsa_simplified import build_network, optimize_network
+pip install paramiko
 
-# Define a simple network
-nodes = ["Berlin", "Paris", "London"]
-edges = [("Berlin", "Paris"), ("Paris", "London")]
-
-# Build the network
-network = build_network(nodes, edges)
-
-# Run optimization
-result = optimize_network(network)
-print(f"Status: {result['status']}")
-print(f"Objective: {result['objective_value']}")
+ssh_pw = SSHConfig(host="server", user="me", port=22, password="YOUR_PASSWORD")
+transfer_to_server_pw(artifact, "~/work/network_source.pkl.gz", ssh_pw)
+run_remote_job_pw(ssh_pw, remote_cmd, remote_workdir="~/work")
 ```
 
-## Working with Data
+3) **Fetch + analyze locally (light):**
+```python
+from pypsa_simplified import fetch_from_server, load_optimized_network, network_summary
 
-### Data Directory
-
-Place your datasets in the `data/` directory:
-
-- **`data/raw/`**: Store raw input files (CSV, JSON, etc.). This directory is gitignored and not tracked in version control.
-- **`data/processed/`**: Store processed/cleaned data. Also gitignored.
-
-### Example Data Organization
-
-```
-data/
-├── raw/
-│   ├── nodes.csv              # Node/bus data
-│   ├── lines.csv              # Transmission line data
-│   └── generators.csv         # Generator specifications
-└── processed/
-    └── network.json           # Preprocessed network
+fetch_from_server("~/work/optimized.nc", "data/processed/optimized.nc", ssh)
+network = load_optimized_network("data/processed/optimized.nc")
+print(network_summary(network))
 ```
 
-**Note**: Large data files should always be placed in `data/raw/` or `data/processed/` as these directories are gitignored.
+### Running on Slurm (optional)
 
-## Package Modules
+- Copy `network_source.pkl.gz` to the cluster scratch folder.
+- Submit a batch job that calls the CLI: `python -m pypsa_simplified.remote_job --source network_source.pkl.gz --output optimized.nc --snapshot-limit 168`.
+- Adjust the `snapshot-limit` or solver settings via environment variables in your Slurm script; wrap the command in `srun` if needed.
 
-### core.py
-- `build_network(nodes, edges)`: Build a network structure
-- `load_csv(path)`: Load CSV data with error handling
+### Data layout
 
-### optimize.py
-- `optimize_network(network, options=None)`: Optimize network configuration
-  - Uses pulp if available, otherwise falls back to deterministic placeholder
+- **`data/raw/OSM Prebuilt Electricity Network/`**: OSM-derived CSVs (buses, lines, links, converters, transformers)
+- **`data/processed/`**: Serialized artifacts for transfer (gitignored)
 
-### utils.py
-- `ensure_dir(path)`: Create directory if it doesn't exist
-- `read_json(path)`: Read JSON file
-- `write_json(obj, path)`: Write object to JSON file
+### Key APIs
 
-## Development
+- `prepare_osm_source(osm_dir, countries)` → dict with cleaned buses/lines/links
+- `serialize_network_source(path, data)` / `load_serialized_source(path)`
+- `build_network_from_source(data, NetworkOptions)` → PyPSA ``Network``
+- `optimize_network(network, snapshot_slice)` → runs PyPSA optimization
+- `save_optimized_network(path, network)` / `load_optimized_network(path)`
+- `SSHConfig`, `transfer_to_server`, `run_remote_job`, `fetch_from_server`
+- `env_install.ensure_packages()` → conda guidance for servers
 
-### Code Structure
+### Server dependency helper
 
-The package follows a simple, modular structure:
-- Core functionality in `src/pypsa_simplified/`
-- Examples and workflows in `notebooks/`
-- Data management through utility functions
+```bash
+python -m pypsa_simplified.env_install
+# or inside Python
+from pypsa_simplified import ensure_packages, format_plan
+print(format_plan(ensure_packages()))
+```
 
-### Adding New Features
+If your server uses system Python and conda isn't available, use:
 
-1. Add new functions to appropriate module (`core.py`, `optimize.py`, `utils.py`)
-2. Include docstrings with examples
-3. Update notebooks to demonstrate new features
-4. Update this README if adding major functionality
+```bash
+pip install pypsa pandas numpy matplotlib paramiko
+```
 
-## Notes
+### Tests
 
-- Notebooks are committed with outputs cleared to keep repository size small
-- The `.gitignore` file excludes `data/raw/` and `data/processed/` directories
-- The optimization module gracefully handles missing pulp dependency
+Minimal sanity checks live in `tests/` and can be run with `pytest` (PyPSA required for network test):
 
-## License
-
-This project is provided as-is for educational and research purposes.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests.
+```bash
+pytest tests/test_io_and_network.py
+```

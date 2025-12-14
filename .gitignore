@@ -45,6 +45,7 @@ htmlcov/
 data/raw/
 data/processed/
 PyPSA/
+pypsa_EUR/
 
 # Keep a small sample file in repo if present
 !data/sample.csv
