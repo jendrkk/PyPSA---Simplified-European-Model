@@ -83,8 +83,11 @@ def _optimize_with_pulp(network, options):
     for edge, var in flow_vars.items():
         solution[f"{edge[0]}_to_{edge[1]}"] = pulp.value(var)
     
+    # Get status string safely
+    status = pulp.LpStatus.get(prob.status, "Unknown")
+    
     result = {
-        "status": pulp.LpStatus[prob.status],
+        "status": status,
         "objective_value": pulp.value(prob.objective),
         "solution": solution,
         "solver": "pulp-CBC",
