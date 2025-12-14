@@ -1,0 +1,76 @@
+name: Python Package CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements-dev.txt
+    
+    - name: Run smoke tests
+      run: |
+        # Add src to PYTHONPATH
+        export PYTHONPATH="${PYTHONPATH}:${GITHUB_WORKSPACE}/src"
+        
+        # Test package import
+        python -c "from pypsa_simplified import __version__; print(f'Package version: {__version__}')"
+        
+        # Test core functionality
+        python -c "
+        from pypsa_simplified import build_network, load_csv, optimize_network
+        
+        # Build a test network
+        nodes = ['A', 'B', 'C']
+        edges = [('A', 'B'), ('B', 'C')]
+        network = build_network(nodes, edges)
+        print(f'Built network with {len(network[\"nodes\"])} nodes and {len(network[\"edges\"])} edges')
+        
+        # Run optimization (should work with fallback)
+        result = optimize_network(network)
+        print(f'Optimization status: {result[\"status\"]}')
+        print(f'Solver used: {result[\"solver\"]}')
+        
+        assert result['status'] in ['Optimal', 'optimal'], 'Optimization failed'
+        print('✓ All smoke tests passed!')
+        "
+    
+    - name: Test utility functions
+      run: |
+        export PYTHONPATH="${PYTHONPATH}:${GITHUB_WORKSPACE}/src"
+        
+        python -c "
+        from pypsa_simplified.utils import ensure_dir, write_json, read_json
+        import os
+        
+        # Test directory creation
+        test_dir = ensure_dir('/tmp/test_pypsa')
+        assert test_dir.exists(), 'Directory creation failed'
+        print('✓ Directory creation works')
+        
+        # Test JSON write/read
+        test_data = {'test': 'data', 'value': 42}
+        json_path = test_dir / 'test.json'
+        write_json(test_data, json_path)
+        loaded_data = read_json(json_path)
+        assert loaded_data == test_data, 'JSON read/write mismatch'
+        print('✓ JSON read/write works')
+        
+        print('✓ All utility tests passed!')
+        "

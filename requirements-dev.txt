@@ -1,0 +1,17 @@
+# Development requirements for PyPSA Simplified European Model
+
+# Core dependencies
+pandas>=1.3.0
+
+# Jupyter environment
+jupyter>=1.0.0
+notebook>=6.4.0
+
+# Optional: Linear programming solver
+# Uncomment to install pulp for optimization
+# pulp>=2.7.0
+
+# Code quality (optional)
+# pytest>=7.0.0
+# black>=22.0.0
+# flake8>=4.0.0
