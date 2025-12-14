@@ -1,0 +1,59 @@
+# .gitignore for PyPSA---Simplified-European-Model
+# Ignore files and folders that are local, build artifacts, virtual envs, or large data.
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# Python packaging/build
+build/
+dist/
+*.egg-info/
+
+# Logs and databases
+*.log
+*.pid
+*.sqlite3
+
+# Coverage
+.coverage
+htmlcov/
+
+# Local environment files
+.env
+.env.*
+
+# Large or local-only data folders (do not track by default)
+Final Model/
+data/raw/
+data/processed/
+
+# Keep a small sample file in repo if present
+!data/sample.csv
+
+# Ignore common backup/temp files
+*~
+*.bak
+
+# Notebook outputs (optional, if you didn't strip outputs already)
+# NB: consider using nbstripout to avoid committing outputs
+
+# End of .gitignore
