@@ -42,7 +42,6 @@ htmlcov/
 .env.*
 
 # Large or local-only data folders (do not track by default)
-Final Model/
 data/raw/
 data/processed/
 
