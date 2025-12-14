@@ -44,6 +44,7 @@ htmlcov/
 # Large or local-only data folders (do not track by default)
 data/raw/
 data/processed/
+data/other/
 PyPSA/
 pypsa_EUR/
 
