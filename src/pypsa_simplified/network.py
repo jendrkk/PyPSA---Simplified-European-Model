@@ -68,7 +68,7 @@ T_CARRIERS = {
     },
 }
 
-def build_network(n: pypsa.Network, data_dict: dp.OSMData, options: Dict[str, Any] | None = None) -> pypsa.Network:
+def build_network(n: pypsa.Network, data_dict: dp.RawData, options: Dict[str, Any] | None = None) -> pypsa.Network:
     """
     Build a `pypsa.Network` from a lightweight source dictionary.
 
@@ -382,7 +382,7 @@ def build_network_from_serialized_source(n: pypsa.Network, source_path: str, opt
     Convenience helper: load a gzipped JSON source file and build a network.
     """
     
-    data = dp.OSMdata(None)
+    data = dp.RawData(None)
     data = data.load(source_path)
     
     return build_network(n, data, options=options)

@@ -15,13 +15,17 @@ import gzip
 import json
 import os
 
-class OSMData:
+class RawData:
     """Container for OSM Prebuilt Electricity Network data as DataFrames."""
+    
     def __init__(self, data: Dict[str, pd.DataFrame | None] | None) -> None:
         self.data = data
     
     def get(self, key: str) -> pd.DataFrame | None:
         return self.data.get(key, None)
+    
+    def set(self, key: str, value: pd.DataFrame | None) -> None:
+        self.data[key] = value
     
     def keys(self):
         return self.data.keys()
@@ -216,3 +220,28 @@ def prepare_osm_source(osm_dir: str | Path) -> Dict[str, object]:
 
     return out
 
+def prepare_generator_data(gen_data_path: str | Path) -> pd.DataFrame | None:
+    """
+    Load generator data CSV into a DataFrame.
+
+    Parameters
+    - gen_data_path: path to the `generator_data.csv` file.
+
+    Returns
+    - DataFrame with generator data or None if file does not exist.
+    """
+    gen_data_path = Path(gen_data_path)
+    if not gen_data_path.exists():
+        return None
+
+    df = pd.read_csv(gen_data_path)
+
+    # Try to convert every column to float; if conversion fails, leave it unchanged.
+    for col in df.columns:
+        try:
+            df[col] = pd.to_numeric(df[col], errors="raise").astype(float)
+        except Exception:
+            # leave column as-is if any value cannot be converted to float
+            pass
+
+    return df
