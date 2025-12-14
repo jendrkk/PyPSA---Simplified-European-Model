@@ -2,32 +2,49 @@
 
 __version__ = "0.2.0"
 
-# Public API exports
-from io import (
-	serialize_network_source,
-	load_serialized_source,
-	save_optimized_network,
-	load_optimized_network,
-)
-from .remote import SSHConfig, transfer_to_server, run_remote_job, fetch_from_server
-from .network import (
-	build_network_from_source,
-	build_network_from_serialized_source,
-	optimize_network,
-	network_summary,
-)
+"""Top-level package for pypsa_simplified.
 
-__all__ = [
-	"serialize_network_source",
-	"load_serialized_source",
-	"save_optimized_network",
-	"load_optimized_network",
-	"SSHConfig",
-	"transfer_to_server",
-	"run_remote_job",
-	"fetch_from_server",
-	"build_network_from_source",
-	"build_network_from_serialized_source",
-	"optimize_network",
-	"network_summary",
-]
+This module uses lazy imports so `import pypsa_simplified` is lightweight
+and does not immediately require heavy optional dependencies (e.g. `pypsa`).
+Accessing attributes will import the appropriate submodule on demand.
+"""
+
+_lazy_map = {
+	# io
+	"serialize_network_source": "pypsa_simplified.io",
+	"load_serialized_source": "pypsa_simplified.io",
+	"save_optimized_network": "pypsa_simplified.io",
+	"load_optimized_network": "pypsa_simplified.io",
+	# remote
+	"SSHConfig": "pypsa_simplified.remote",
+	"transfer_to_server": "pypsa_simplified.remote",
+	"run_remote_job": "pypsa_simplified.remote",
+	"fetch_from_server": "pypsa_simplified.remote",
+	# network
+	"build_network_from_source": "pypsa_simplified.network",
+	"build_network_from_serialized_source": "pypsa_simplified.network",
+	"optimize_network": "pypsa_simplified.network",
+	"network_summary": "pypsa_simplified.network",
+	# data prep
+	"prepare_osm_source": "pypsa_simplified.data_prep",
+}
+
+
+def __getattr__(name: str):
+	"""Lazy-load attribute `name` from the mapped submodule."""
+	if name in _lazy_map:
+		module_name = _lazy_map[name]
+		import importlib
+
+		mod = importlib.import_module(module_name)
+		val = getattr(mod, name)
+		globals()[name] = val
+		return val
+	raise AttributeError(f"module {__name__} has no attribute {name}")
+
+
+def __dir__():
+	return sorted(list(globals().keys()) + list(_lazy_map.keys()))
+
+
+__all__ = list(_lazy_map.keys())

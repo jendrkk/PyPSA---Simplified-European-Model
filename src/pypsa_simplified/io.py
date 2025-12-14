@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import gzip
+import pickle
 from typing import Any, Dict
 
 import pypsa
@@ -14,38 +15,52 @@ import pypsa
 
 def serialize_network_source(output_path: str, data_dict: Dict[str, Any]) -> str:
     """
-    Serialize lightweight source inputs needed to build a network.
+    Serialize source inputs needed to build a network.
 
-    Uses gzipped JSON for compactness.
-
-    Returns the written file path.
+    Attempts gzipped JSON first for portability; if the data contains
+    non-JSON-serializable objects (e.g., pandas DataFrames), falls back
+    to gzipped pickle (`.pkl.gz`). Returns the written file path.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with gzip.open(output_path, "wt", encoding="utf-8") as f:
-        json.dump(data_dict, f, separators=(",", ":"))
-    return output_path
+
+    # Try JSON gz
+    try:
+        with gzip.open(output_path, "wt", encoding="utf-8") as f:
+            json.dump(data_dict, f, separators=(",", ":"))
+        return output_path
+    except (TypeError, OverflowError):
+        # Fallback to pickle gzip. If user requested .json.gz, switch to .pkl.gz
+        base, ext = os.path.splitext(output_path)
+        if base.endswith(".json"):
+            base = base[:-5]
+        out = base + ".pkl.gz"
+        with gzip.open(out, "wb") as f:
+            pickle.dump(data_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+        return out
 
 
 def load_serialized_source(input_path: str) -> Dict[str, Any]:
-    """Load previously serialized source inputs (gzipped JSON)."""
-    with gzip.open(input_path, "rt", encoding="utf-8") as f:
-        return json.load(f)
+    """Load previously serialized source inputs supporting gzipped JSON and gzipped pickle."""
+    # Try JSON text mode first
+    try:
+        with gzip.open(input_path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        # Fallback to pickle binary
+        with gzip.open(input_path, "rb") as f:
+            return pickle.load(f)
 
 
 def save_optimized_network(output_path: str, network_obj: pypsa.Network) -> str:
     """
-    Save an optimized PyPSA network in a compact format.
-
-    Preference order:
-    - NetCDF (`.nc`) via `network_obj.export_to_netcdf` for compactness and fidelity.
-
+    Save an optimized PyPSA network. If `output_path` ends with `.nc` it
+    writes NetCDF, otherwise it writes NetCDF with `.nc` appended.
     Returns the written file path.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     if output_path.endswith(".nc"):
         network_obj.export_to_netcdf(output_path)
     else:
-        # Fallback: write NetCDF next to requested path.
         base, _ = os.path.splitext(output_path)
         output_path = base + ".nc"
         network_obj.export_to_netcdf(output_path)
@@ -54,7 +69,7 @@ def save_optimized_network(output_path: str, network_obj: pypsa.Network) -> str:
 
 def load_optimized_network(input_path: str) -> pypsa.Network:
     """
-    Load a PyPSA network previously saved, supporting NetCDF.
+    Load a PyPSA network previously saved in NetCDF format.
     """
     net = pypsa.Network()
     net.import_from_netcdf(input_path)
