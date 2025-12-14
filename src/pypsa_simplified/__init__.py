@@ -21,7 +21,7 @@ _lazy_map = {
 	"run_remote_job": "pypsa_simplified.remote",
 	"fetch_from_server": "pypsa_simplified.remote",
 	# network
-	"build_network_from_source": "pypsa_simplified.network",
+	"build_network": "pypsa_simplified.network",
 	"build_network_from_serialized_source": "pypsa_simplified.network",
 	"optimize_network": "pypsa_simplified.network",
 	"network_summary": "pypsa_simplified.network",

@@ -201,7 +201,18 @@ def prepare_osm_source(osm_dir: str | Path) -> Dict[str, object]:
         df = _read_csv_if_exists(p, special_handling=(f in special_handling_files))
         if df is not None and df.index[0] != 0:
             df = shift_right(df)
+
+        # Try to convert every column to float; if conversion fails, leave it unchanged.
+        if df is not None:
+            for col in df.columns:
+                try:
+                    df[col] = pd.to_numeric(df[col], errors="raise").astype(float)
+                except Exception:
+                    # leave column as-is if any value cannot be converted to float
+                    pass
+
         key = Path(f).stem
         out[key] = df
 
     return out
+

@@ -6,6 +6,7 @@ from typing import Any, Dict
 from shapely.wkt import loads
 import pandas as pd
 import geopandas as gpd
+import numpy as np
 
 import pypsa
 import sys
@@ -67,7 +68,7 @@ T_CARRIERS = {
     },
 }
 
-def build_network_from_source(n: pypsa.Network,data_dict: dp.OSMData, options: Dict[str, Any] | None = None) -> pypsa.Network:
+def build_network(n: pypsa.Network, data_dict: dp.OSMData, options: Dict[str, Any] | None = None) -> pypsa.Network:
     """
     Build a `pypsa.Network` from a lightweight source dictionary.
 
@@ -78,19 +79,26 @@ def build_network_from_source(n: pypsa.Network,data_dict: dp.OSMData, options: D
     data_dict = data_dict.data
     
     # Example: if data_dict contains paths for core components
-    buses_csv = data_dict.get("buses")
-    lines_csv = data_dict.get("lines")
-    links_csv = data_dict.get("links")
-    generators_csv = data_dict.get("generators")
-    loads_csv = data_dict.get("loads")
+    buses = data_dict.get("buses")
+    lines = data_dict.get("lines")
+    links = data_dict.get("links")
+    generators = data_dict.get("generators")
+    loads = data_dict.get("loads")
+    transformers = data_dict.get("transformers", pd.DataFrame())
+    converters = data_dict.get("converters", pd.DataFrame())
     
+    if options is not None and options['snapshots'] is not None:
+        net.set_snapshots(options['snapshots'])
     
-    if options['generation_carriers'] is not None:
+    if options is not None and options['name'] is not None:
+        net.name = options['name']
+    
+    if options is not None and options['generation_carriers'] is not None:
         generation_carriers = options['generation_carriers']
     else:
         generation_carriers = G_CARRIERS
     
-    if options['transmission_carriers'] is not None:
+    if options is not None and options['transmission_carriers'] is not None:
         transmission_carriers = options['transmission_carriers']
     else:
         transmission_carriers = T_CARRIERS
@@ -107,14 +115,16 @@ def build_network_from_source(n: pypsa.Network,data_dict: dp.OSMData, options: D
                 color=carrier_attrs.get("color", "#CCCCCC"),
             )
     
-    if options['countries'] is not None:
+    if options is not None and options['countries'] is not None:
         countries = options['countries']
     else:
-        countries = set(buses_csv['country'])
+        countries = set(buses['country'])
     
-    buses_csv = buses_csv[buses_csv['country'].isin(countries)]
+    buses = buses[buses['country'].isin(countries)].copy()
     
-    for idx, row in buses_csv.iterrows():
+    print(f"Adding {len(buses)} buses...")
+    
+    for idx, row in buses.iterrows():
         voltage_kv = float(row['voltage'])  # Extract actual voltage from OSM data
         
         n.add(
@@ -128,24 +138,32 @@ def build_network_from_source(n: pypsa.Network,data_dict: dp.OSMData, options: D
             under_construction=False if row['under_construction'] == 'f' else True,
         )
     
-    bus_ids_subset = set(buses_csv['bus_id'].values)
+    bus_ids_subset = set(buses['bus_id'].values)
 
-    lines_subset = lines_csv[
-        (lines_csv['bus0_id'].isin(bus_ids_subset)) & 
-        (lines_csv['bus1_id'].isin(bus_ids_subset))
+    lines = lines[
+        (lines['bus0'].isin(bus_ids_subset)) & 
+        (lines['bus1'].isin(bus_ids_subset))
     ].copy()
-
-    print(f"Adding {len(lines_subset)} AC transmission lines")
-
-    for idx, row in lines_subset.iterrows():
+    
+    print(f"Adding {len(lines)} lines...")
+    
+    # Averages
+    ave_r_val = np.mean(lines['r'].dropna()) if not lines['r'].dropna().empty else 0.01
+    ave_x_val = np.mean(lines['x'].dropna()) if not lines['x'].dropna().empty else 0.1
+    ave_s_nom = np.mean(lines['s_nom'].dropna()) if not lines['s_nom'].dropna().empty else 1000
+    ave_length = np.mean(lines['length'].dropna()) if not lines['length'].dropna().empty else 100
+    ave_b_val = np.mean(lines['b'].dropna()) if not lines['b'].dropna().empty else 100
+    ave_circuits = np.mean(lines['circuits'].dropna()) if not lines['circuits'].dropna().empty else 1
+    
+    for idx, row in lines.iterrows():
         try:
             # Extract real line parameters from CSV, with fallbacks
-            r_val = float(row.get('r', 0.01)) if pd.notna(row.get('r')) and float(row.get('r', 0)) > 0 else 0.01
-            x_val = float(row.get('x', 0.1)) if pd.notna(row.get('x')) and float(row.get('x', 0)) > 0 else 0.1
-            s_nom_val = float(row.get('s_nom', 1000)) if pd.notna(row.get('s_nom')) else 1000
-            length_val = float(row.get('length', 100)) if pd.notna(row.get('length')) else 100
-            b_val = float(row.get('b', 100)) if pd.notna(row.get('b')) else 100
-            circuits = int(row.get('circuits', 1)) if pd.notna(row.get('circuits')) else 1
+            r_val = float(row.get('r', ave_r_val)) if pd.notna(row.get('r')) and float(row.get('r', 0)) > 0 else ave_r_val
+            x_val = float(row.get('x', ave_x_val)) if pd.notna(row.get('x')) and float(row.get('x', 0)) > 0 else ave_x_val
+            s_nom_val = float(row.get('s_nom', ave_s_nom)) if pd.notna(row.get('s_nom')) else ave_s_nom
+            length_val = float(row.get('length', ave_length)) if pd.notna(row.get('length')) else ave_length
+            b_val = float(row.get('b', ave_b_val)) if pd.notna(row.get('b')) else ave_b_val
+            circuits = int(row.get('circuits', ave_circuits)) if pd.notna(row.get('circuits')) else ave_circuits
 
             # If all above are default values, then:
             type = ""
@@ -165,8 +183,8 @@ def build_network_from_source(n: pypsa.Network,data_dict: dp.OSMData, options: D
                 "Line",
                 type=type,
                 name=row['line_id'],
-                bus0=row['bus0_id'],
-                bus1=row['bus1_id'],
+                bus0=row['bus0'],
+                bus1=row['bus1'],
                 x=x_val,
                 r=r_val,
                 b=b_val,
@@ -179,31 +197,195 @@ def build_network_from_source(n: pypsa.Network,data_dict: dp.OSMData, options: D
             if idx < 3:  # Print first few errors only
                 print(f"Error adding line {row['line_id']}: {e}")
     
+    transformers = transformers[
+        (transformers['bus0'].isin(bus_ids_subset)) &
+        (transformers['bus1'].isin(bus_ids_subset))
+    ].copy()
+
+    print(f"Adding {len(transformers)} transformers...")
     
+    # Averages for missing data
+    ave_s_nom = np.mean(transformers['s_nom'].dropna()) if not transformers['s_nom'].dropna().empty else 50000
     
-    if buses_csv:
-        net.import_components_from_csv(buses_csv, components=["Bus"])
-    if lines_csv:
-        net.import_components_from_csv(lines_csv, components=["Line"])
-    if generators_csv:
-        net.import_components_from_csv(generators_csv, components=["Generator"])
-    if loads_csv:
-        net.import_components_from_csv(loads_csv, components=["Load"])
-    if links_csv:
-        net.import_components_from_csv(links_csv, components=["Link"])
+    for idx, row in transformers.iterrows():
+        try:
+            # Extract transformer parameters
+            s_nom_val = float(row.get('s_nom', ave_s_nom)) if pd.notna(row.get('s_nom')) else ave_s_nom
+            
+            type = ''
+            if s_nom_val <= 0 or pd.isna(s_nom_val):
+                type = 'Unknown'
+            
+            # Voltage levels for base impedance calculation (if needed)
+            v_bus0 = float(row.get('voltage_bus0', 220))
+            v_bus1 = float(row.get('voltage_bus1', 380))
+            
+            def get_trafo_impedance(v_in, v_out, s_nom):
+                """
+                Calculates per-unit series reactance (x) and resistance (r) for 
+                European EHV transformers based on voltage level and nominal power.
+                
+                Parameters:
+                -----------
+                v_in, v_out : float
+                    Voltages on primary and secondary side in kV.
+                s_nom : float
+                    Nominal power in MVA.
+                    
+                Returns:
+                --------
+                (x_pu, r_pu) : tuple of floats
+                """
+                # 1. Determine Voltage Class (use the highest voltage)
+                v_max = max(v_in, v_out)
+                
+                # 2. Assign Standard Short Circuit Voltage (uk) -> x_pu
+                # Based on typical ENTSO-E / IEC standard values for European Grid
+                if v_max >= 380:      # 380/400 kV level
+                    x_pu = 0.15       # Typical range: 14-16%
+                    base_x_r = 60.0   # Very high efficiency
+                elif v_max >= 220:    # 220 kV level
+                    x_pu = 0.12       # Typical range: 12-14%
+                    base_x_r = 50.0   # High efficiency
+                else:                 # Fallback for unexpected lower voltages
+                    x_pu = 0.10
+                    base_x_r = 40.0
+
+                # 3. Adjust X/R ratio based on size (S_nom)
+                # Larger transformers are more efficient (higher X/R).
+                # We apply a logarithmic scaling to account for your large range [500, 25000].
+                # We saturate the scaling to avoid unrealistic values for aggregate transformers.
+                
+                # Scale factor: typically X/R increases with size. 
+                # For a 5000 MVA aggregate, we assume it behaves like multiple large units in parallel,
+                # so we keep the X/R of a large single unit (approx 60-80).
+                
+                if s_nom > 1000:
+                    # For huge aggregates, we cap the efficiency at the limit of physical large units
+                    x_r_ratio = min(base_x_r * 1.5, 90.0) 
+                else:
+                    # For smaller specific units, scale down slightly
+                    x_r_ratio = base_x_r
+                    
+                # 4. Calculate Resistance
+                # r is derived from x and the X/R ratio
+                r_pu = x_pu / x_r_ratio
+                
+                # Safety clamp for numerical stability in solvers (avoid exactly 0)
+                r_pu = max(r_pu, 1e-5)
+                
+                return x_pu, r_pu
+            
+            x_val, r_val = get_trafo_impedance(v_bus0, v_bus1, s_nom_val)
+            
+            n.add(
+                "Transformer",
+                name=row['transformer_id'],
+                bus0=row['bus0'],
+                bus1=row['bus1'],
+                type=type,
+                s_nom=s_nom_val,
+                x=x_val,
+                r=r_val,
+                model="t",  # T-model for transformers
+            )
+        except Exception as e:
+            if idx < 3:
+                print(f"Error adding transformer {row.get('transformer_id', 'unknown')}: {e}")
+    
+    converters = converters.copy()
+    
+    print(f"Adding {len(converters)} converters...")
+    
+    # Average p_nom if missing
+    ave_p_nom = np.mean(converters['p_nom'].dropna()) if not converters['p_nom'].dropna().empty else 500
+    
+    for idx, row in converters.iterrows():
+        try:
+            converter_id = row.get('converter_id', f"conv_{idx}")
+            bus_ac = row.get('bus0')  # AC side
+            bus_dc_ref = row.get('bus1')  # DC side bus reference
+            
+            # Only add converter if AC bus exists
+            if bus_ac not in n.buses.index and bus_dc_ref not in n.buses.index:
+                continue
+            
+            # Create DC bus if it doesn't exist
+            dc_bus_id = f"{bus_dc_ref}-DC"
+            if dc_bus_id not in n.buses.index:
+                # Extract coordinates (roughly at same location as AC bus)
+                try:
+                    ac_bus = n.buses.loc[bus_ac]
+                    x_coord = ac_bus['x']
+                    y_coord = ac_bus['y']
+                except:
+                    x_coord, y_coord = 0, 0
+                
+                n.add(
+                    "Bus",
+                    name=dc_bus_id,
+                    x=x_coord,
+                    y=y_coord,
+                    carrier="DC",
+                    v_nom=float(row.get('voltage', 300)),  # DC voltage nominal
+                )
+            
+            # Add converter as a Link
+            p_nom_val = float(row.get('p_nom', ave_p_nom)) if pd.notna(row.get('p_nom')) else ave_p_nom
+            
+            n.add(
+                "Link",
+                name=converter_id,
+                bus0=bus_ac,
+                bus1=dc_bus_id,
+                p_nom=p_nom_val,
+                efficiency=0.99,  # HVDC converter loss
+                carrier="",  # PyPSA-EUR convention: empty string for converters (bidirectional)
+                under_construction=False if row.get('under_construction') == 'f' else True,
+            )
+        except Exception as e:
+            if idx < 3:
+                print(f"Error processing converter {row.get('converter_id', 'unknown')}: {e}")
+
+    links = links[
+        (links['bus0'].isin(bus_ids_subset)) & 
+        (links['bus1'].isin(bus_ids_subset))
+    ].copy()
+
+    print(f"Adding {len(links)} links...")
+
+    # Averages for missing data
+    ave_p_nom = np.mean(links['p_nom'].dropna()) if not links['p_nom'].dropna().empty else 500
+    for idx, row in links.iterrows():
+        try:
+            p_nom_val = float(row.get('p_nom', ave_p_nom)) if pd.notna(row.get('p_nom')) else ave_p_nom
+            
+            n.add(
+                "Link",
+                name=row['link_id'],
+                bus0=row['bus0'],
+                bus1=row['bus1'],
+                p_nom=p_nom_val,
+                efficiency=1.0,  # No loss for simplified AC links (can adjust for realism)
+                carrier="AC",  # AC transmission
+            )
+        except Exception as e:
+            if idx < 3:
+                print(f"Error adding AC link {row.get('link_id', 'unknown')}: {e}")
 
     # Additional options (CRS, snapshots, carriers) can be applied here
     return net
 
 
-def build_network_from_serialized_source(source_path: str, options: Dict[str, Any] | None = None) -> pypsa.Network:
+def build_network_from_serialized_source(n: pypsa.Network, source_path: str, options: Dict[str, Any] | None = None) -> pypsa.Network:
     """
     Convenience helper: load a gzipped JSON source file and build a network.
     """
+    
     data = dp.OSMdata(None)
     data = data.load(source_path)
     
-    return build_network_from_source(data, options=options)
+    return build_network(n, data, options=options)
 
 
 def optimize_network(network_obj: pypsa.Network, solver_opts: Dict[str, Any] | None = None) -> pypsa.Network:
@@ -228,6 +410,7 @@ def network_summary(network_obj: pypsa.Network) -> Dict[str, Any]:
         "n_lines": len(network_obj.lines),
         "n_generators": len(network_obj.generators),
         "n_loads": len(network_obj.loads),
+        
         "snapshots": list(map(str, getattr(network_obj, "snapshots", []))),
     }
 
