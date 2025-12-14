@@ -45,7 +45,7 @@ htmlcov/
 data/raw/
 data/processed/
 data/other/
-data/cashe/geometry/
+data/cache/geometry/
 PyPSA/
 pypsa_EUR/
 
