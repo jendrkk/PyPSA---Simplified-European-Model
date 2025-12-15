@@ -27,7 +27,10 @@ _lazy_map = {
 	"network_summary": "pypsa_simplified.network",
 	# data prep
 	"prepare_osm_source": "pypsa_simplified.data_prep",
-	"prepare_generator_data": "pypsa_simplified.data_prep"
+	"prepare_generator_data": "pypsa_simplified.data_prep",
+	# demand
+	"prepare_demand_data": "pypsa_simplified.demand",
+	"calculate_population_voronoi": "pypsa_simplified.demand",
 }
 
 

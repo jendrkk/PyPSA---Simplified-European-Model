@@ -64,8 +64,8 @@ COUNTRIES_URL = "https://gisco-services.ec.europa.eu/distribution/v2/countries/g
 # European country codes (ISO 2-letter)
 EUROPE_COUNTRIES = [
     "AL", "AT", "BA", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", 'EL', "ES", "FI",
-    "FR", "GB", "GR", "HR", "HU", "IE", "IS", "IT", "LT", "LU", "LV", "ME", "MK",
-    "MT", "NL", "NO", "PL", "PT", "RO", "RS", "SE", "SI", "SK", "XK", "UA", "MD",
+    "FR", "GR", "HR", "HU", "IE", "IS", "IT", "LT", "LU", "LV", "ME", "MK",
+    "MT", "NL", "NO", "PL", "PT", "RO", "RS", "SE", "SI", "SK", "XK", "UA", 'UK', "MD",
 ]
 
 # EU27 member states (as of 2023)
@@ -809,8 +809,8 @@ def get_voronoi(
             )
             buses_in_shape = buses_filtered[mask]
         
-        if len(buses_in_shape) < 3:
-            logger.warning(f"Skipping {label}: need at least 3 buses for Voronoi, found {len(buses_in_shape)}")
+        if len(buses_in_shape) < 2:
+            logger.warning(f"Skipping {label}: need at least 2 buses for Voronoi, found {len(buses_in_shape)}")
             continue
         
         # Extract coordinates
@@ -898,7 +898,7 @@ if __name__ == "__main__":
     
     # 3. Try to load buses and create Voronoi diagrams
     print("Step 3/4: Creating Voronoi diagrams for EU27 buses...")
-    join = True
+    join = input("Join? ([T]/F): ").strip().lower() != 'f'
     try:
         import pypsa_simplified.data_prep as dp
         
