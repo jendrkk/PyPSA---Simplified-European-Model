@@ -63,14 +63,14 @@ COUNTRIES_URL = "https://gisco-services.ec.europa.eu/distribution/v2/countries/g
 
 # European country codes (ISO 2-letter)
 EUROPE_COUNTRIES = [
-    "AL", "AT", "BA", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI",
+    "AL", "AT", "BA", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", 'EL', "ES", "FI",
     "FR", "GB", "GR", "HR", "HU", "IE", "IS", "IT", "LT", "LU", "LV", "ME", "MK",
     "MT", "NL", "NO", "PL", "PT", "RO", "RS", "SE", "SI", "SK", "XK", "UA", "MD",
 ]
 
 # EU27 member states (as of 2023)
 EU27 = [
-    'AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR',
+    'AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'EL', 'FI', 'FR',
     'DE', 'GR', 'HU', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT', 'NL',
     'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE'
 ]
@@ -898,6 +898,7 @@ if __name__ == "__main__":
     
     # 3. Try to load buses and create Voronoi diagrams
     print("Step 3/4: Creating Voronoi diagrams for EU27 buses...")
+    join = True
     try:
         import pypsa_simplified.data_prep as dp
         
@@ -909,16 +910,17 @@ if __name__ == "__main__":
             
             if raw_data.data.get('buses') is not None:
                 # Create Voronoi for EU27
-                voronoi_gdf, mapping_df = get_voronoi(raw_data, countries=EU27, join=True, cache_dir=cache_dir)
+                _join = "_join" if join else ""
+                voronoi_gdf, mapping_df = get_voronoi(raw_data, countries=EU27, join=join, cache_dir=cache_dir)
                 
                 if len(voronoi_gdf) > 0:
                     # Save Voronoi cells
-                    voronoi_path = save_shapes_efficiently(voronoi_gdf, cache_dir / "voronoi_eu27")
+                    voronoi_path = save_shapes_efficiently(voronoi_gdf, cache_dir / f"voronoi_eu27{_join}")
                     print(f"   ✓ Saved {len(voronoi_gdf)} Voronoi cells to {voronoi_path}")
                     print(f"   File size: {voronoi_path.stat().st_size / 1024:.1f} KB")
                     
                     # Save mapping
-                    mapping_path = cache_dir / "voronoi_eu27_mapping.csv"
+                    mapping_path = cache_dir / f"voronoi_eu27_mapping{_join}.csv"
                     mapping_df.to_csv(mapping_path, index=False)
                     print(f"   ✓ Saved bus-to-cell mapping to {mapping_path}")
                     print(f"   File size: {mapping_path.stat().st_size / 1024:.1f} KB\n")
