@@ -23,7 +23,6 @@ from shapely.geometry import Polygon, MultiPolygon, Point, LineString, LinearRin
 from shapely.ops import unary_union, polygonize, polygonize_full
 from scipy.spatial import Voronoi
 import numpy as np
-import multiprocessing
 import datetime
 
 # Add src to path for data_prep import
@@ -389,18 +388,16 @@ def point_in_shape(
         try:
             point = Point(lon, lat)
         except Exception as e:
-            raise ValueError("Either provide lat/lon or a Shapely Point object") from e
-        
-    try:
-        point = Point(float(lon), float(lat))
-    except Exception as e2:
-        logger.error(f"Error creating Point from lat/lon: {e}, {e2}")
-        return False
+            try:
+                point = Point(float(lon), float(lat))
+            except Exception as e2:
+                logger.error(f"Error creating Point from lat/lon: {e}, {e2}")
+                return False
     
     # Extract geometry if GeoDataFrame
     if isinstance(shape, gpd.GeoDataFrame):
         if len(shape) == 0 or shape is None:
-            logger.info("Empty GeoDataFrame provided for shape.")
+            logger.warning("Empty GeoDataFrame provided for shape.")
             return False
         # Create GeoSeries with proper CRS
         geom = gpd.GeoSeries([point], crs=crs)
@@ -799,269 +796,6 @@ def to_point(input: str) -> Point:
         logger.error(f"Error converting to Point: {e}")
         return None
 
-def to_rect(polygon: Union[Polygon, MultiPolygon]) -> Polygon:
-    """
-    Return a (minimal) rectangle polygon that fully contains the input
-    Polygon or MultiPolygon. The rectangle is the minimum-rotated
-    rectangle of the geometry (smallest-area enclosing rectangle).
-
-    If numerical issues cause the rectangle to not strictly cover the
-    input geometry, the rectangle is expanded by a very small epsilon
-    to ensure containment.
-    """
-    if polygon is None:
-        raise ValueError("No geometry provided to to_rect")
-
-    geom = polygon
-    # Normalize inputs: lists/tuples of geometries or MultiPolygons
-    if isinstance(geom, (list, tuple)):
-        geom = unary_union(geom)
-    if getattr(geom, 'geom_type', '').startswith('Multi') or geom.geom_type == 'GeometryCollection':
-        geom = unary_union(geom)
-
-    # Reject empty geometries early
-    if getattr(geom, 'is_empty', False):
-        raise ValueError("Empty geometry provided to to_rect")
-
-    # Attempt to repair invalid geometries
-    if not getattr(geom, 'is_valid', True):
-        try:
-            geom = geom.buffer(0)
-        except Exception:
-            try:
-                geom = unary_union(geom)
-            except Exception:
-                raise ValueError("Cannot repair invalid geometry for to_rect")
-
-    # Check for non-finite coordinates (bounds is a quick proxy)
-    bounds = geom.bounds
-    if not np.all(np.isfinite(bounds)):
-        raise ValueError("Geometry contains non-finite coordinates (NaN/Inf)")
-
-    # Compute rotated rectangle, but be robust against Shapely/GEOS warnings
-    import warnings
-    rect = None
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        try:
-            rect = geom.minimum_rotated_rectangle
-        except Exception:
-            rect = None
-
-        # If a runtime warning from oriented_envelope occurred, treat as failure
-        warn_msgs = ";".join([str(x.message) for x in w if getattr(x, 'message', None)])
-        if rect is None or any('oriented_envelope' in str(m) or 'invalid value' in str(m) for m in warn_msgs.split(';')):
-            rect = None
-
-    # Fallback to axis-aligned envelope if needed
-    if rect is None or getattr(rect, 'is_empty', False):
-        rect = geom.envelope
-
-    # Ensure rectangle is valid and covers the geometry
-    if not getattr(rect, 'is_valid', True):
-        try:
-            rect = rect.buffer(0)
-        except Exception:
-            rect = geom.envelope
-
-    # If the rectangle doesn't cover the geometry (numerical edge cases), expand slightly
-    if not rect.covers(geom):
-        # Try tiny expansion of the rectangle
-        try:
-            rect = rect.buffer(1e-9)
-        except Exception:
-            rect = geom.envelope
-
-    # Final containment check; if still failing use envelope expanded a bit
-    if not rect.covers(geom):
-        rect = geom.envelope.buffer(1e-9)
-
-    return rect
-
-def _check_bus_on_sea(args):
-    """
-    Helper function for parallel sea filtering.
-    Checks if a bus is on the sea (outside combined shape).
-    
-    Parameters
-    ----------
-    args : tuple
-        (idx, geometry_str, combined_shape)
-        
-    Returns
-    -------
-    idx or None
-        Returns idx if bus should be dropped (on sea), None otherwise
-    """
-    idx, geometry_str, combined_shape = args
-    try:
-        pt = to_point(geometry_str)
-        if not point_in_shape(point=pt, shape=combined_shape):
-            return idx
-        return None
-    except Exception:
-        return None
-
-def _process_voronoi_region(args):
-    """
-    Helper function for parallel Voronoi region processing.
-    
-    Parameters
-    ----------
-    args : tuple
-        (point_idx, region_idx, vor_regions, vor_vertices, points, bus_ids, shape, label)
-        
-    Returns
-    -------
-    dict or None
-        Voronoi cell data dict if successful, None otherwise
-    """
-    point_idx, region_idx, vor_regions, vor_vertices, points, bus_ids, shape, label = args
-    
-    region = vor_regions[region_idx]
-    
-    if not region or -1 in region:
-        # For infinite regions, create a bounded region using a large buffer
-        finite_vertices = [vor_vertices[i] for i in region if i != -1]
-        
-        if len(finite_vertices) >= 2:
-            try:
-                bus_point = Point(points[point_idx])
-                large_buffer = bus_point.buffer(10.0)  # 10 degrees ~ 1000km
-                clipped = large_buffer.intersection(shape)
-                
-                if not clipped.is_empty and get_shape_area(clipped) > 0:
-                    return {
-                        'geometry': clipped,
-                        'bus_id': bus_ids[point_idx],
-                        'bus_x': points[point_idx, 0],
-                        'bus_y': points[point_idx, 1],
-                        'region': label,
-                        'area_km2': get_shape_area(clipped, unit='km2'),
-                        'bounded': False
-                    }
-            except Exception:
-                pass
-        return None
-    
-    # Create polygon from Voronoi vertices
-    polygon_coords = [vor_vertices[i] for i in region]
-    try:
-        voronoi_poly = Polygon(polygon_coords)
-        
-        if not voronoi_poly.is_valid:
-            voronoi_poly = voronoi_poly.buffer(0)
-        
-        # Clip to shape boundary
-        clipped = voronoi_poly.intersection(shape)
-        
-        if not clipped.is_empty and get_shape_area(clipped) > 0:
-            return {
-                'geometry': clipped,
-                'bus_id': bus_ids[point_idx],
-                'bus_x': points[point_idx, 0],
-                'bus_y': points[point_idx, 1],
-                'region': label,
-                'area_km2': get_shape_area(clipped, unit='km2'),
-                'bounded': True
-            }
-    except Exception:
-        pass
-    
-    return None
-
-def _process_single_shape_voronoi(args):
-    """
-    Helper function for parallel processing of Voronoi for a single shape.
-    
-    Parameters
-    ----------
-    args : tuple
-        (shape, label, buses_filtered, join, if_clip_coordinates, add_mirror_points)
-        
-    Returns
-    -------
-    list
-        List of Voronoi cell dicts for this shape
-    """
-    shape, label, buses_filtered, join, if_clip_coordinates, add_mirror_points = args
-    
-    # Get buses within this shape
-    if if_clip_coordinates:
-        europes_extremes = Polygon([(-12,72),(40.3,72),(40.3,34),(-12,34)])
-        shape = mask_shape(shape, europes_extremes, verbose=False)
-    
-    if join:
-        buses_in_shape = buses_filtered
-    else:
-        mask = buses_filtered['country'] == label
-        buses_in_shape = buses_filtered[mask]
-    
-    if len(buses_in_shape) < 1:
-        return []
-    
-    # Extract coordinates
-    points = buses_in_shape[['x', 'y']].values
-    bus_ids = buses_in_shape['bus_id'].values
-    num_real_points = len(points)
-    
-    # Add mirror points to bound Voronoi cells
-    if add_mirror_points:
-        bounds = shape.bounds
-        margin = max(bounds[2] - bounds[0], bounds[3] - bounds[1]) * 0.5
-        
-        mirror_points = []
-        grid_spacing = margin / 3
-        
-        for x in np.arange(bounds[0] - margin, bounds[2] + margin, grid_spacing):
-            mirror_points.append([x, bounds[1] - margin])
-            mirror_points.append([x, bounds[3] + margin])
-        for y in np.arange(bounds[1] - margin, bounds[3] + margin, grid_spacing):
-            mirror_points.append([bounds[0] - margin, y])
-            mirror_points.append([bounds[2] + margin, y])
-        
-        points = np.vstack([points, mirror_points])
-    
-    # Create Voronoi diagram
-    vor = Voronoi(points)
-    
-    # Process Voronoi regions in parallel
-    process_args = [
-        (point_idx, vor.point_region[point_idx], vor.regions, vor.vertices, 
-         points, bus_ids, shape, label)
-        for point_idx in range(num_real_points)
-    ]
-    
-    with multiprocessing.Pool() as pool:
-        results = pool.map(_process_voronoi_region, process_args)
-    
-    # Filter out None results and collect valid cells
-    voronoi_cells = [r for r in results if r is not None]
-    buses_with_cells = {cell['bus_id'] for cell in voronoi_cells}
-    
-    # For buses without cells, create fallback cells
-    buses_without_cells = set(bus_ids) - buses_with_cells
-    if buses_without_cells:
-        for bus_id in buses_without_cells:
-            idx = np.where(bus_ids == bus_id)[0][0]
-            bus_point = Point(points[idx, 0], points[idx, 1])
-            
-            small_buffer = bus_point.buffer(0.1)
-            clipped = small_buffer.intersection(shape)
-            
-            if not clipped.is_empty:
-                voronoi_cells.append({
-                    'geometry': clipped,
-                    'bus_id': bus_id,
-                    'bus_x': points[idx, 0],
-                    'bus_y': points[idx, 1],
-                    'region': label,
-                    'area_km2': get_shape_area(clipped, unit='km2'),
-                    'bounded': False
-                })
-    
-    return voronoi_cells
-
 def get_voronoi(
     raw_data: data_prep.RawData,
     countries: Optional[List[str]] = None,
@@ -1124,12 +858,12 @@ def get_voronoi(
         combined = join_shapes(country_shapes)
         try:
             mask = buses_df.apply(
-            lambda row: point_in_shape(point = to_point(row['geometry']), shape = combined),
+            lambda row: point_in_shape(row['geometry'], combined),
             axis=1
             )
         except Exception as e:
             mask = buses_df.apply(
-                lambda row: point_in_shape(lat = row['y'], lon = row['x'], shape = combined),
+                lambda row: point_in_shape(row['y'], row['x'], combined),
                 axis=1
             )
         buses_filtered = buses_df[mask].copy()
@@ -1151,12 +885,14 @@ def get_voronoi(
     
     # Filter out buses that are on the sea (with small tolerance)
     combined_shape = buffer_shape(combined_shape, distance_km=0.1)
-    
-    # Parallel sea filtering
-    check_args = [(idx, row['geometry'], combined_shape) for idx, row in buses_filtered.iterrows()]
-    with multiprocessing.Pool() as pool:
-        drop_results = pool.map(_check_bus_on_sea, check_args)
-    buses_to_drop = [idx for idx in drop_results if idx is not None]
+    buses_to_drop = []
+    for idx, row in buses_filtered.iterrows():
+        try:
+            pt = to_point(row['geometry'])
+            if not point_in_shape(point=pt, shape=combined_shape):
+                buses_to_drop.append(idx)
+        except Exception as e:
+            logger.debug(f"Could not check bus {row['bus_id']}: {e}")
     
     buses_filtered = buses_filtered.drop(buses_to_drop)
     logger.info(f"{len(buses_filtered)} buses remain after sea filtering. Removed {len(buses_to_drop)} buses.")
@@ -1180,30 +916,142 @@ def get_voronoi(
     # Compute Voronoi for each shape
     all_voronoi_cells = []
     
-    # Log bus counts for each shape
-    if not join:
-        for label in shape_labels:
-            mask = buses_filtered['country'] == label
+    for shape, label in zip(shapes, shape_labels):
+        # Get buses within this shape
+        if if_clip_coordiantes:
+            europes_extremes = Polygon([(-12,72),(40.3,72),(40.3,34),(-12,34)])
+            shape = mask_shape(shape, europes_extremes)
+        if join:
+            buses_in_shape = buses_filtered
+        else:
+            mask = buses_filtered.apply(
+                lambda row: row['country'] == label,
+                axis=1
+            )
             logger.info(f"Computing Voronoi for {label} with {mask.sum()} buses")
-    
-    # Prepare arguments for parallel processing of shapes
-    shape_args = [
-        (shape, label, buses_filtered, join, if_clip_coordiantes, add_mirror_points)
-        for shape, label in zip(shapes, shape_labels)
-    ]
-    
-    # Process shapes - use parallel for multiple shapes, sequential for single shape
-    if len(shape_args) > 1:
-        # Parallel processing for multiple shapes
-        with multiprocessing.Pool() as pool:
-            shape_results = pool.map(_process_single_shape_voronoi, shape_args)
-        # Flatten results
-        for cells in shape_results:
-            all_voronoi_cells.extend(cells)
-    else:
-        # Single shape - process with internal parallelization
-        cells = _process_single_shape_voronoi(shape_args[0])
-        all_voronoi_cells.extend(cells)
+            buses_in_shape = buses_filtered[mask]
+        
+        if len(buses_in_shape) < 1:
+            logger.warning(f"Skipping {label}: need at least 1 bus for Voronoi, found {len(buses_in_shape)}")
+            continue
+        
+        # Extract coordinates
+        points = buses_in_shape[['x', 'y']].values
+        bus_ids = buses_in_shape['bus_id'].values
+        num_real_points = len(points)
+        
+        # Add mirror points to bound Voronoi cells
+        if add_mirror_points:
+            bounds = shape.bounds  # (minx, miny, maxx, maxy)
+            margin = max(bounds[2] - bounds[0], bounds[3] - bounds[1]) * 0.5
+            
+            # Create grid of mirror points outside boundary
+            mirror_points = []
+            grid_spacing = margin / 3
+            
+            # Add points around the bounding box
+            for x in np.arange(bounds[0] - margin, bounds[2] + margin, grid_spacing):
+                mirror_points.append([x, bounds[1] - margin])
+                mirror_points.append([x, bounds[3] + margin])
+            for y in np.arange(bounds[1] - margin, bounds[3] + margin, grid_spacing):
+                mirror_points.append([bounds[0] - margin, y])
+                mirror_points.append([bounds[2] + margin, y])
+            
+            points = np.vstack([points, mirror_points])
+            logger.info(f"Added {len(mirror_points)} mirror points to ensure bounded Voronoi cells")
+        
+        # Create Voronoi diagram
+        vor = Voronoi(points)
+        
+        # Track which buses got cells
+        buses_with_cells = set()
+        
+        # Convert Voronoi regions to polygons and clip to shape
+        for point_idx in range(num_real_points):  # Only process real points, not mirrors
+            region_idx = vor.point_region[point_idx]
+            region = vor.regions[region_idx]
+            
+            if not region or -1 in region:
+                # For infinite regions, create a bounded region using the Voronoi ridges
+                logger.debug(f"Bus {bus_ids[point_idx]} has infinite Voronoi region, attempting to bound it")
+                
+                # Find finite Voronoi vertices and create a large polygon
+                finite_vertices = [vor.vertices[i] for i in region if i != -1]
+                
+                if len(finite_vertices) >= 2:
+                    # Create a polygon from finite vertices and extend to boundary
+                    try:
+                        # Use a large buffer around the point and intersect with shape
+                        bus_point = Point(points[point_idx])
+                        large_buffer = bus_point.buffer(10.0)  # 10 degrees ~ 1000km
+                        clipped = large_buffer.intersection(shape)
+                        
+                        if not clipped.is_empty and get_shape_area(clipped) > 0:
+                            buses_with_cells.add(bus_ids[point_idx])
+                            all_voronoi_cells.append({
+                                'geometry': clipped,
+                                'bus_id': bus_ids[point_idx],
+                                'bus_x': points[point_idx, 0],
+                                'bus_y': points[point_idx, 1],
+                                'region': label,
+                                'area_km2': get_shape_area(clipped, unit='km2'),
+                                'bounded': False  # Mark as unbounded originally
+                            })
+                            continue
+                    except Exception as e:
+                        logger.debug(f"Could not create fallback cell for bus {bus_ids[point_idx]}: {e}")
+                
+                continue
+            
+            # Create polygon from Voronoi vertices
+            polygon_coords = [vor.vertices[i] for i in region]
+            try:
+                voronoi_poly = Polygon(polygon_coords)
+                
+                if not voronoi_poly.is_valid:
+                    voronoi_poly = voronoi_poly.buffer(0)  # Fix invalid geometries
+                
+                # Clip to shape boundary
+                clipped = voronoi_poly.intersection(shape)
+                
+                if not clipped.is_empty and get_shape_area(clipped) > 0:
+                    buses_with_cells.add(bus_ids[point_idx])
+                    all_voronoi_cells.append({
+                        'geometry': clipped,
+                        'bus_id': bus_ids[point_idx],
+                        'bus_x': points[point_idx, 0],
+                        'bus_y': points[point_idx, 1],
+                        'region': label,
+                        'area_km2': get_shape_area(clipped, unit='km2'),
+                        'bounded': True
+                    })
+            except Exception as e:
+                logger.debug(f"Could not create Voronoi cell for bus {bus_ids[point_idx]}: {e}")
+                continue
+        
+        # For buses without cells, create fallback cells
+        buses_without_cells = set(bus_ids) - buses_with_cells
+        if buses_without_cells:
+            logger.warning(f"{len(buses_without_cells)} buses did not get Voronoi cells, creating fallback cells")
+            
+            for bus_id in buses_without_cells:
+                idx = np.where(bus_ids == bus_id)[0][0]
+                bus_point = Point(points[idx, 0], points[idx, 1])
+                
+                # Create a small buffer around the bus
+                small_buffer = bus_point.buffer(0.1)  # 0.1 degrees ~ 10km
+                clipped = small_buffer.intersection(shape)
+                
+                if not clipped.is_empty:
+                    all_voronoi_cells.append({
+                        'geometry': clipped,
+                        'bus_id': bus_id,
+                        'bus_x': points[idx, 0],
+                        'bus_y': points[idx, 1],
+                        'region': label,
+                        'area_km2': get_shape_area(clipped, unit='km2'),
+                        'bounded': False  # Fallback cell
+                    })
     
     if len(all_voronoi_cells) == 0:
         logger.warning("No valid Voronoi cells created")
