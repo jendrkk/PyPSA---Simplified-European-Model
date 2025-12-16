@@ -1162,7 +1162,7 @@ def get_voronoi(
     country_shapes_gdf.loc[country_shapes_gdf['country'] == 'UK', 'country'] = 'GB'
     
     # Filter out buses that are on the sea (with small tolerance)
-    combined_shape = buffer_shape(combined_shape, distance_km=0.02)
+    combined_shape = buffer_shape(combined_shape, distance_km=0.2) 
     
     # Parallel sea filtering
     check_args = [(idx, row['geometry'], combined_shape) for idx, row in buses_filtered.iterrows()]

@@ -8,6 +8,9 @@ import shapely
 from shapely.geometry import Point
 import multiprocessing as mp
 import psutil
+import threading
+import time
+import os
 
 # Add src to path for data_prep import
 def find_repo_root(start_path: Path, max_up: int = 6) -> Path:
@@ -34,8 +37,8 @@ except ImportError:
 repo_root = find_repo_root(Path(__file__).parent)
 src_path = repo_root / 'src'
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging to stdout so monitor and other logs appear together
+logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger(__name__)
 
 
@@ -154,11 +157,65 @@ def calculate_population_voronoi(pop_path: str | Path, voronoi_path: str | Path,
     return voronoi_csv
 
 if __name__ == "__main__":
-    pop_path = repo_root / 'data' / 'processed' / 'jrc_population_nonzero.parquet'
-    voronoi_path = geom.DEFAULT_CACHE_DIR / 'voronoi_eu27_join.parquet'
-    import datetime as dt
-    start_time = dt.datetime.now()
-    calculate_population_voronoi(pop_path, voronoi_path)
-    # In seconds
-    end_time = dt.datetime.now()
-    logger.info(f"Total computation time: {end_time - start_time}")
+    def monitor_system(stop_event: threading.Event, interval: int = 10) -> None:
+        """Background system monitor that prints CPU (per-core) and memory usage every `interval` seconds.
+
+        The monitor stops when `stop_event` is set.
+        """
+        proc = psutil.Process(os.getpid())
+        # Prime cpu_percent measurements
+        psutil.cpu_percent(interval=None)
+        while not stop_event.is_set():
+            # Get per-core CPU usage (1s sampling for accurate per-core values)
+            per_core = psutil.cpu_percent(percpu=True, interval=1)
+            total = psutil.cpu_percent()
+            vm = psutil.virtual_memory()
+            rss = proc.memory_info().rss / (1024 ** 2)
+            vms = proc.memory_info().vms / (1024 ** 2)
+            # Log monitor output so it doesn't get cleared and interleaves with other logs
+            lines = []
+            lines.append(f"System monitor (pid={proc.pid}) - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            lines.append(f"Total CPU: {total:.1f}%    Logical cores: {psutil.cpu_count(logical=True)}    Physical cores: {psutil.cpu_count(logical=False)}")
+            lines.append("Per-core: " + ' '.join(f"{p:5.1f}%" for p in per_core))
+            lines.append(f"System memory: {vm.percent:.1f}% (available={vm.available // (1024**2)} MB)")
+            lines.append(f"Process memory: RSS={rss:.1f} MB  VMS={vms:.1f} MB")
+            lines.append("(Press Ctrl+C to cancel monitoring output; program will continue.)")
+            logger.info('\n'.join(lines))
+            # Wait for the remainder of the interval, checking stop_event
+            for _ in range(interval - 1):
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
+
+
+    def main():
+        pop_path = repo_root / 'data' / 'processed' / 'jrc_population_nonzero.parquet'
+        voronoi_path = geom.DEFAULT_CACHE_DIR / 'voronoi_eu27_join.parquet'
+        import datetime as dt
+
+        answer = input('Show live system monitoring during run? (y/N): ').strip().lower()
+        enable_monitor = answer.startswith('y')
+
+        stop_event = threading.Event()
+        monitor_thread = None
+        if enable_monitor:
+            monitor_thread = threading.Thread(target=monitor_system, args=(stop_event, 10), daemon=True)
+            monitor_thread.start()
+
+        start_time = dt.datetime.now()
+        try:
+            calculate_population_voronoi(pop_path, voronoi_path)
+        finally:
+            # Ensure we stop the monitor thread if it was started
+            if enable_monitor:
+                stop_event.set()
+                # Give monitor a moment to exit
+                monitor_thread.join(timeout=5)
+            end_time = dt.datetime.now()
+            logger.info(f"Total computation time: {end_time - start_time}")
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Allow user to abort with Ctrl+C gracefully
+        logger.info('Interrupted by user.')
