@@ -1281,7 +1281,7 @@ if __name__ == "__main__":
                     print(f"   File size: {voronoi_path.stat().st_size / 1024:.1f} KB")
                     
                     # Save mapping
-                    mapping_path = cache_dir / f"voronoi_eu27_mapping{_join}.csv"
+                    mapping_path = cache_dir / f"voronoi_eu27{_join}.csv"
                     mapping_df.to_csv(mapping_path, index=False)
                     print(f"   ✓ Saved bus-to-cell mapping to {mapping_path}")
                     print(f"   File size: {mapping_path.stat().st_size / 1024:.1f} KB\n")
