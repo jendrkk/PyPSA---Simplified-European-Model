@@ -19,8 +19,8 @@ from typing import List, Optional, Tuple, Union
 import geopandas as gpd
 import pandas as pd
 import requests
-from shapely.geometry import MultiPolygon, Point, Polygon
-from shapely.ops import unary_union
+from shapely.geometry import Polygon, MultiPolygon, Point, LineString, LinearRing, MultiLineString
+from shapely.ops import unary_union, polygonize, polygonize_full
 from scipy.spatial import Voronoi
 import numpy as np
 
@@ -63,9 +63,10 @@ COUNTRIES_URL = "https://gisco-services.ec.europa.eu/distribution/v2/countries/g
 
 # European country codes (ISO 2-letter)
 EUROPE_COUNTRIES = [
-    "AL", "AT", "BA", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", 'EL', "ES", "FI",
-    "FR", "GR", "HR", "HU", "IE", "IS", "IT", "LT", "LU", "LV", "ME", "MK",
-    "MT", "NL", "NO", "PL", "PT", "RO", "RS", "SE", "SI", "SK", "XK", "UA", 'UK', "MD",
+    "AL", "AT", "BA", "BE", "BG", "CH", "CZ", "DE", "DK", 
+    "EE", 'EL', "ES", "FI", "FR", "HR", "HU", "IE", "IT",
+    "LT", "LU", "LV", "ME", "MK", "NL", "NO", "PL", "PT",
+    "RO", "RS", "SE", "SI", "SK", "XK", "UA", 'UK', "MD"
 ]
 
 # EU27 member states (as of 2023)
@@ -320,9 +321,10 @@ def join_shapes(
 
 
 def point_in_shape(
-    lat: float,
-    lon: float,
-    shape: Union[Polygon, MultiPolygon, gpd.GeoDataFrame],
+    lat: float = None,
+    lon: float = None,
+    point: Point = None,
+    shape: Union[Polygon, MultiPolygon, gpd.GeoDataFrame] = None,
     crs: str = GEO_CRS
 ) -> bool:
     """
@@ -358,11 +360,20 @@ def point_in_shape(
     >>> is_in_berlin = point_in_shape(52.5200, 13.4050, berlin_region)
     """
     # Create point
-    point = Point(lon, lat)  # Note: Point takes (x, y) = (lon, lat)
+    if not isinstance(point, Point):
+        try:
+            point = Point(lon, lat)
+        except Exception as e:
+            try:
+                point = Point(float(lon), float(lat))
+            except Exception as e2:
+                logger.error(f"Error creating Point from lat/lon: {e}, {e2}")
+                return False
     
     # Extract geometry if GeoDataFrame
     if isinstance(shape, gpd.GeoDataFrame):
-        if len(shape) == 0:
+        if len(shape) == 0 or shape is None:
+            logger.warning("Empty GeoDataFrame provided for shape.")
             return False
         # Create GeoSeries with proper CRS
         geom = gpd.GeoSeries([point], crs=crs)
@@ -379,7 +390,8 @@ def point_in_shape(
 def mask_shape(
     shape1: Union[Polygon, MultiPolygon, gpd.GeoDataFrame],
     shape2: Union[Polygon, MultiPolygon, gpd.GeoDataFrame],
-    return_gdf: bool = False
+    return_gdf: bool = False,
+    verbose: bool = True
 ) -> Union[Polygon, MultiPolygon, gpd.GeoDataFrame]:
     """
     Compute the intersection of two boundaries (logical AND operation).
@@ -437,8 +449,8 @@ def mask_shape(
     
     # Compute intersection
     intersection = geom1.intersection(geom2)
-    
-    logger.info(f"Computed intersection of boundaries")
+    if verbose:
+        logger.info(f"Computed intersection of boundaries")
     
     if return_gdf:
         return gpd.GeoDataFrame({'geometry': [intersection]}, crs=crs1 or GEO_CRS)
@@ -600,6 +612,32 @@ def simplify_shape(
         logger.info(f"Simplified shape with tolerance={tolerance}")
         return gpd.GeoDataFrame({'geometry': [simplified]}, crs=GEO_CRS) if return_gdf else simplified
 
+def fill_from_boundary(boundary):
+    """
+    boundary can be a closed LineString/LinearRing, a collection (MultiLineString), or
+    any iterable of LineStrings. Returns a polygon or MultiPolygon.
+    """
+    # Single closed ring -> just make a Polygon
+    if boundary.geom_type in ("LineString", "LinearRing"):
+        # ensure closed: first and last coordinate equal
+        coords = list(boundary.coords)
+        if coords[0] != coords[-1]:
+            coords.append(coords[0])
+        return Polygon(coords)
+
+    # If it's a collection of lines, merge and polygonize
+    # polygonize only makes polygons from closed loops
+    merged = unary_union(boundary)
+    polys = list(polygonize(merged))
+    if not polys:
+        # helpful debug info: polygonize_full returns dangles/cuts that prevented polygonization
+        polys_all, dangles, cuts, invalids = polygonize_full(merged)
+        # return what polygonize_full found (polys_all is an iterator)
+        polys = list(polys_all)
+    if len(polys) == 1:
+        return polys[0]
+    return MultiPolygon(polys)
+
 
 # Convenience function for common use case
 def get_european_union_shape(
@@ -710,12 +748,33 @@ def load_shapes_efficiently(input_path: Path) -> gpd.GeoDataFrame:
     
     raise FileNotFoundError(f"No file found: {input_path}")
 
+def to_point(input: str) -> Point:
+    """
+    Convert input string "POINT(lat lon)" to Shapely Point.
+    
+    Parameters
+    ----------
+    input : str
+        String in format "POINT(lat lon)" typical 
+        in our data.
+        
+    Returns
+    -------
+    Point
+        Shapely Point object
+    """
+    try:
+        return Point(input.strip("POINT (").strip(")").split(" "))
+    except Exception as e:
+        logger.error(f"Error converting to Point: {e}")
+        return None
 
 def get_voronoi(
-    raw_data: 'data_prep.RawData',
+    raw_data: data_prep.RawData,
     countries: Optional[List[str]] = None,
     join: bool = True,
-    cache_dir: Optional[Path] = None
+    cache_dir: Optional[Path] = None,
+    add_mirror_points: bool = True
 ) -> Tuple[gpd.GeoDataFrame, pd.DataFrame]:
     """
     Create Voronoi diagram for bus locations within country boundaries.
@@ -734,6 +793,8 @@ def get_voronoi(
         If False, compute separate Voronoi diagrams for each country.
     cache_dir : Path, optional
         Cache directory for country shapes
+    add_mirror_points : bool
+        If True, add mirror points outside boundary to ensure bounded Voronoi cells
         
     Returns
     -------
@@ -764,12 +825,19 @@ def get_voronoi(
         buses_filtered = buses_df[buses_df['country'].isin(countries)].copy()
     else:
         # If no country column, use geometry check
+        logger.warning("Filtering buses by point-in-shape check")
         country_shapes = download_country_shapes(countries, cache_dir)
         combined = join_shapes(country_shapes)
-        mask = buses_df.apply(
-            lambda row: point_in_shape(row['y'], row['x'], combined),
+        try:
+            mask = buses_df.apply(
+            lambda row: point_in_shape(row['geometry'], combined),
             axis=1
-        )
+            )
+        except Exception as e:
+            mask = buses_df.apply(
+                lambda row: point_in_shape(row['y'], row['x'], combined),
+                axis=1
+            )
         buses_filtered = buses_df[mask].copy()
     
     if len(buses_filtered) == 0:
@@ -780,10 +848,28 @@ def get_voronoi(
     
     # Get country shapes
     country_shapes_gdf = download_country_shapes(countries, cache_dir)
+    combined_shape = join_shapes(country_shapes_gdf)
+    
+    # Rename country EL to GR for consistency
+    country_shapes_gdf.loc[country_shapes_gdf['country'] == 'EL', 'country'] = 'GR'
+    country_shapes_gdf.loc[country_shapes_gdf['country'] == 'UK', 'country'] = 'GB'
+    
+    # Filter out buses that are on the sea (with small tolerance)
+    buses_to_drop = []
+    for idx, row in buses_filtered.iterrows():
+        try:
+            pt = to_point(row['geometry'])
+            if not point_in_shape(point=pt, shape=combined_shape):
+                buses_to_drop.append(idx)
+        except Exception as e:
+            logger.debug(f"Could not check bus {row['bus_id']}: {e}")
+    
+    buses_filtered = buses_filtered.drop(buses_to_drop)
+    logger.info(f"{len(buses_filtered)} buses remain after sea filtering. Removed {len(buses_to_drop)} buses.")
     
     if join:
         # Single Voronoi diagram for all countries
-        shapes = [join_shapes(country_shapes_gdf)]
+        shapes = [combined_shape]
         shape_labels = ['combined']
     else:
         # Separate Voronoi diagram for each country
@@ -794,6 +880,8 @@ def get_voronoi(
             if len(country_gdf) > 0:
                 shapes.append(country_gdf.geometry.iloc[0])
                 shape_labels.append(country_code)
+
+    logger.info(f"Computing Voronoi for {len(shape_labels)} shapes")
     
     # Compute Voronoi for each shape
     all_voronoi_cells = []
@@ -804,28 +892,82 @@ def get_voronoi(
             buses_in_shape = buses_filtered
         else:
             mask = buses_filtered.apply(
-                lambda row: point_in_shape(row['y'], row['x'], shape),
+                lambda row: row['country'] == label,
                 axis=1
             )
+            logger.info(f"Computing Voronoi for {label} with {mask.sum()} buses")
             buses_in_shape = buses_filtered[mask]
         
-        if len(buses_in_shape) < 2:
-            logger.warning(f"Skipping {label}: need at least 2 buses for Voronoi, found {len(buses_in_shape)}")
+        if len(buses_in_shape) < 1:
+            logger.warning(f"Skipping {label}: need at least 1 bus for Voronoi, found {len(buses_in_shape)}")
             continue
         
         # Extract coordinates
         points = buses_in_shape[['x', 'y']].values
         bus_ids = buses_in_shape['bus_id'].values
+        num_real_points = len(points)
+        
+        # Add mirror points to bound Voronoi cells
+        if add_mirror_points:
+            bounds = shape.bounds  # (minx, miny, maxx, maxy)
+            margin = max(bounds[2] - bounds[0], bounds[3] - bounds[1]) * 0.5
+            
+            # Create grid of mirror points outside boundary
+            mirror_points = []
+            grid_spacing = margin / 3
+            
+            # Add points around the bounding box
+            for x in np.arange(bounds[0] - margin, bounds[2] + margin, grid_spacing):
+                mirror_points.append([x, bounds[1] - margin])
+                mirror_points.append([x, bounds[3] + margin])
+            for y in np.arange(bounds[1] - margin, bounds[3] + margin, grid_spacing):
+                mirror_points.append([bounds[0] - margin, y])
+                mirror_points.append([bounds[2] + margin, y])
+            
+            points = np.vstack([points, mirror_points])
+            logger.info(f"Added {len(mirror_points)} mirror points to ensure bounded Voronoi cells")
         
         # Create Voronoi diagram
         vor = Voronoi(points)
         
+        # Track which buses got cells
+        buses_with_cells = set()
+        
         # Convert Voronoi regions to polygons and clip to shape
-        for point_idx, region_idx in enumerate(vor.point_region):
+        for point_idx in range(num_real_points):  # Only process real points, not mirrors
+            region_idx = vor.point_region[point_idx]
             region = vor.regions[region_idx]
             
             if not region or -1 in region:
-                # Skip infinite regions
+                # For infinite regions, create a bounded region using the Voronoi ridges
+                logger.debug(f"Bus {bus_ids[point_idx]} has infinite Voronoi region, attempting to bound it")
+                
+                # Find finite Voronoi vertices and create a large polygon
+                finite_vertices = [vor.vertices[i] for i in region if i != -1]
+                
+                if len(finite_vertices) >= 2:
+                    # Create a polygon from finite vertices and extend to boundary
+                    try:
+                        # Use a large buffer around the point and intersect with shape
+                        bus_point = Point(points[point_idx])
+                        large_buffer = bus_point.buffer(10.0)  # 10 degrees ~ 1000km
+                        clipped = large_buffer.intersection(shape)
+                        
+                        if not clipped.is_empty and get_shape_area(clipped) > 0:
+                            buses_with_cells.add(bus_ids[point_idx])
+                            all_voronoi_cells.append({
+                                'geometry': clipped,
+                                'bus_id': bus_ids[point_idx],
+                                'bus_x': points[point_idx, 0],
+                                'bus_y': points[point_idx, 1],
+                                'region': label,
+                                'area_km2': get_shape_area(clipped, unit='km2'),
+                                'bounded': False  # Mark as unbounded originally
+                            })
+                            continue
+                    except Exception as e:
+                        logger.debug(f"Could not create fallback cell for bus {bus_ids[point_idx]}: {e}")
+                
                 continue
             
             # Create polygon from Voronoi vertices
@@ -833,21 +975,50 @@ def get_voronoi(
             try:
                 voronoi_poly = Polygon(polygon_coords)
                 
+                if not voronoi_poly.is_valid:
+                    voronoi_poly = voronoi_poly.buffer(0)  # Fix invalid geometries
+                
                 # Clip to shape boundary
                 clipped = voronoi_poly.intersection(shape)
                 
-                if not clipped.is_empty and clipped.area > 0:
+                if not clipped.is_empty and get_shape_area(clipped) > 0:
+                    buses_with_cells.add(bus_ids[point_idx])
                     all_voronoi_cells.append({
                         'geometry': clipped,
                         'bus_id': bus_ids[point_idx],
                         'bus_x': points[point_idx, 0],
                         'bus_y': points[point_idx, 1],
                         'region': label,
-                        'area_km2': get_shape_area(clipped, unit='km2')
+                        'area_km2': get_shape_area(clipped, unit='km2'),
+                        'bounded': True
                     })
             except Exception as e:
                 logger.debug(f"Could not create Voronoi cell for bus {bus_ids[point_idx]}: {e}")
                 continue
+        
+        # For buses without cells, create fallback cells
+        buses_without_cells = set(bus_ids) - buses_with_cells
+        if buses_without_cells:
+            logger.warning(f"{len(buses_without_cells)} buses did not get Voronoi cells, creating fallback cells")
+            
+            for bus_id in buses_without_cells:
+                idx = np.where(bus_ids == bus_id)[0][0]
+                bus_point = Point(points[idx, 0], points[idx, 1])
+                
+                # Create a small buffer around the bus
+                small_buffer = bus_point.buffer(0.1)  # 0.1 degrees ~ 10km
+                clipped = small_buffer.intersection(shape)
+                
+                if not clipped.is_empty:
+                    all_voronoi_cells.append({
+                        'geometry': clipped,
+                        'bus_id': bus_id,
+                        'bus_x': points[idx, 0],
+                        'bus_y': points[idx, 1],
+                        'region': label,
+                        'area_km2': get_shape_area(clipped, unit='km2'),
+                        'bounded': False  # Fallback cell
+                    })
     
     if len(all_voronoi_cells) == 0:
         logger.warning("No valid Voronoi cells created")
@@ -863,9 +1034,10 @@ def get_voronoi(
         'area_km2': voronoi_gdf['area_km2'],
         'bus_x': voronoi_gdf['bus_x'],
         'bus_y': voronoi_gdf['bus_y'],
+        'bounded': voronoi_gdf['bounded'],
     })
     
-    logger.info(f"Created {len(voronoi_gdf)} Voronoi cells")
+    logger.info(f"Created {len(voronoi_gdf)} Voronoi cells ({(voronoi_gdf['bounded']==True).sum()} bounded, {(voronoi_gdf['bounded']==False).sum()} fallback)")
     
     return voronoi_gdf, mapping_df
 
@@ -884,8 +1056,10 @@ if __name__ == "__main__":
     
     # 1. Download all European country shapes
     print("Step 1/4: Downloading all European country boundaries...")
-    all_countries = download_country_shapes(EUROPE_COUNTRIES)
+    all_countries = download_country_shapes()
     countries_path = save_shapes_efficiently(all_countries, cache_dir / "all_countries")
+    all_countries = download_country_shapes(EUROPE_COUNTRIES)
+    countries_path = save_shapes_efficiently(all_countries, cache_dir / "all_EUROPE_countries")
     print(f"   ✓ Saved {len(all_countries)} countries to {countries_path}")
     print(f"   File size: {countries_path.stat().st_size / 1024:.1f} KB\n")
     
@@ -898,7 +1072,8 @@ if __name__ == "__main__":
     
     # 3. Try to load buses and create Voronoi diagrams
     print("Step 3/4: Creating Voronoi diagrams for EU27 buses...")
-    join = input("Join? ([T]/F): ").strip().lower() != 'f'
+    join = input("Join? ([T]/F): ").strip().lower()
+    join = (join == '' or join == 't' or join == 'T')
     try:
         import pypsa_simplified.data_prep as dp
         
