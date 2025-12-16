@@ -7,7 +7,7 @@ from typing import Dict
 import shapely
 from shapely.geometry import Point
 import multiprocessing as mp
-
+import psutil
 
 # Add src to path for data_prep import
 def find_repo_root(start_path: Path, max_up: int = 6) -> Path:
@@ -128,11 +128,17 @@ def calculate_population_voronoi(pop_path: str | Path, voronoi_path: str | Path,
     check_args = [(idx, row, pop_grid) for idx, row in voronoi_gdf.iterrows()]
     with mp.Pool() as pool:
         pop_datas = pool.map(_sqares_in_rect, check_args)
+        logger.info(f"Using {psutil.cpu_count(logical=False)} CPU cores for parallel processing.")
+        logger.info(f"Memory usage: {psutil.virtual_memory().percent}%")
+        logger.info(f"CPU usage: {psutil.cpu_percent(interval=1)}%")
     
     logger.info("Summing population within each Voronoi cell...")
     check_args = [(idx, voronoi_gdf.iloc[idx], pop_datas[idx]) for idx in range(len(voronoi_gdf))]
     with mp.Pool() as pool:
         populations = pool.map(_sum_population_in_shape, check_args)
+        logger.info(f"Using {psutil.cpu_count(logical=False)} CPU cores for parallel processing.")
+        logger.info(f"Memory usage: {psutil.virtual_memory().percent}%")
+        logger.info(f"CPU usage: {psutil.cpu_percent(interval=1)}%")
     
     logger.info("Population calculation completed.")
     voronoi_gdf['population'] = populations

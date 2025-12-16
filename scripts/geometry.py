@@ -12,7 +12,7 @@ Based on practices from PyPSA-Eur project.
 
 import logging
 import sys
-import zipfile
+import shapely
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -896,7 +896,7 @@ def _check_bus_on_sea(args):
     idx, geometry_str, combined_shape = args
     try:
         pt = to_point(geometry_str)
-        if not point_in_shape(point=pt, shape=combined_shape):
+        if not shapely.within(pt, combined_shape):
             return idx
         return None
     except Exception:
@@ -927,7 +927,7 @@ def _process_voronoi_region(args):
         if len(finite_vertices) >= 2:
             try:
                 bus_point = Point(points[point_idx])
-                large_buffer = bus_point.buffer(10.0)  # 10 degrees ~ 1000km
+                large_buffer = bus_point.buffer(7.0)  # 7 degrees ~ 700km
                 clipped = large_buffer.intersection(shape)
                 
                 if not clipped.is_empty and get_shape_area(clipped) > 0:
@@ -1032,8 +1032,20 @@ def _process_single_shape_voronoi(args):
         for point_idx in range(num_real_points)
     ]
     
-    with multiprocessing.Pool() as pool:
-        results = pool.map(_process_voronoi_region, process_args)
+    # Avoid creating nested pools: if this function is running inside a
+    # daemon worker (i.e. called via Pool.map), creating another Pool
+    # will raise "daemonic processes are not allowed to have children".
+    # Detect that and fall back to sequential processing in that case.
+    results = None
+    current_proc = multiprocessing.current_process()
+    use_parallel_regions = (not getattr(current_proc, 'daemon', False)) and len(process_args) > 0
+
+    if use_parallel_regions:
+        with multiprocessing.Pool() as pool:
+            results = pool.map(_process_voronoi_region, process_args)
+    else:
+        # Sequential fallback (safe inside daemon worker)
+        results = [_process_voronoi_region(pa) for pa in process_args]
     
     # Filter out None results and collect valid cells
     voronoi_cells = [r for r in results if r is not None]
@@ -1150,7 +1162,7 @@ def get_voronoi(
     country_shapes_gdf.loc[country_shapes_gdf['country'] == 'UK', 'country'] = 'GB'
     
     # Filter out buses that are on the sea (with small tolerance)
-    combined_shape = buffer_shape(combined_shape, distance_km=0.1)
+    combined_shape = buffer_shape(combined_shape, distance_km=0.02)
     
     # Parallel sea filtering
     check_args = [(idx, row['geometry'], combined_shape) for idx, row in buses_filtered.iterrows()]
