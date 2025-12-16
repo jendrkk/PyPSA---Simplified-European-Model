@@ -76,6 +76,7 @@ EU27 = [
     'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE'
 ]
 
+EUROPE_EXTREME_POINTS = Polygon([(-12,72),(40.3,72),(40.3,34),(-12,34)])
 
 def _ensure_cache_dir(cache_dir: Optional[Path] = None) -> Path:
     """
@@ -137,7 +138,8 @@ def _download_file(url: str, output_path: Path, force: bool = False) -> Path:
 def download_country_shapes(
     countries: Optional[List[str]] = None,
     cache_dir: Optional[Path] = None,
-    force_download: bool = False
+    force_download: bool = False,
+    clip_to_continental: bool = True
 ) -> gpd.GeoDataFrame:
     """
     Download country shapes for Europe from Eurostat GISCO.
@@ -153,6 +155,8 @@ def download_country_shapes(
         Directory for caching downloaded data
     force_download : bool
         If True, re-download even if cached
+    clip_to_continental : bool
+        If True, clip shapes to continental Europe (EUROPE_EXTREME_POINTS)
         
     Returns
     -------
@@ -193,14 +197,23 @@ def download_country_shapes(
     if gdf.crs != GEO_CRS:
         gdf = gdf.to_crs(GEO_CRS)
     
-    logger.info(f"Loaded {len(gdf)} country shapes")
+    # Clip to continental Europe if requested
+    if clip_to_continental:
+        gdf['geometry'] = gdf.geometry.intersection(EUROPE_EXTREME_POINTS)
+        # Remove empty geometries
+        gdf = gdf[~gdf.geometry.is_empty].copy()
+        logger.info(f"Clipped to continental Europe: {len(gdf)} country shapes remain")
+    else:
+        logger.info(f"Loaded {len(gdf)} country shapes")
+    
     return gdf
 
 
 def download_nuts3_shapes(
     countries: Optional[List[str]] = None,
     cache_dir: Optional[Path] = None,
-    force_download: bool = False
+    force_download: bool = False,
+    clip_to_continental: bool = True
 ) -> gpd.GeoDataFrame:
     """
     Download NUTS-3 region shapes for Europe from Eurostat GISCO.
@@ -219,6 +232,8 @@ def download_nuts3_shapes(
         Directory for caching downloaded data
     force_download : bool
         If True, re-download even if cached
+    clip_to_continental : bool
+        If True, clip shapes to continental Europe (EUROPE_EXTREME_POINTS)
         
     Returns
     -------
@@ -267,7 +282,15 @@ def download_nuts3_shapes(
     if gdf.crs != GEO_CRS:
         gdf = gdf.to_crs(GEO_CRS)
     
-    logger.info(f"Loaded {len(gdf)} NUTS-3 region shapes")
+    # Clip to continental Europe if requested
+    if clip_to_continental:
+        gdf['geometry'] = gdf.geometry.intersection(EUROPE_EXTREME_POINTS)
+        # Remove empty geometries
+        gdf = gdf[~gdf.geometry.is_empty].copy()
+        logger.info(f"Clipped to continental Europe: {len(gdf)} NUTS-3 region shapes remain")
+    else:
+        logger.info(f"Loaded {len(gdf)} NUTS-3 region shapes")
+    
     return gdf
 
 
@@ -642,7 +665,8 @@ def fill_from_boundary(boundary):
 # Convenience function for common use case
 def get_european_union_shape(
     cache_dir: Optional[Path] = None,
-    force_download: bool = False
+    force_download: bool = False,
+    clip_to_continental: bool = True
 ) -> Polygon:
     """
     Get the unified boundary of the European Union.
@@ -656,6 +680,8 @@ def get_european_union_shape(
         Directory for caching downloaded data
     force_download : bool
         If True, re-download even if cached
+    clip_to_continental : bool
+        If True, clip shapes to continental Europe (EUROPE_EXTREME_POINTS)
         
     Returns
     -------
@@ -670,7 +696,7 @@ def get_european_union_shape(
     >>> # Check if a point is in the EU
     >>> is_in_eu = point_in_shape(52.5200, 13.4050, eu)
     """
-    countries = download_country_shapes(EU27, cache_dir, force_download)
+    countries = download_country_shapes(EU27, cache_dir, force_download, clip_to_continental)
     return join_shapes(countries)
 
 
@@ -774,7 +800,8 @@ def get_voronoi(
     countries: Optional[List[str]] = None,
     join: bool = True,
     cache_dir: Optional[Path] = None,
-    add_mirror_points: bool = True
+    add_mirror_points: bool = True,
+    if_clip_coordiantes: bool = True
 ) -> Tuple[gpd.GeoDataFrame, pd.DataFrame]:
     """
     Create Voronoi diagram for bus locations within country boundaries.
@@ -839,6 +866,7 @@ def get_voronoi(
                 axis=1
             )
         buses_filtered = buses_df[mask].copy()
+
     
     if len(buses_filtered) == 0:
         logger.warning(f"No buses found in countries: {countries}")
@@ -846,8 +874,8 @@ def get_voronoi(
     
     logger.info(f"Creating Voronoi diagram for {len(buses_filtered)} buses in {len(countries)} countries")
     
-    # Get country shapes
-    country_shapes_gdf = download_country_shapes(countries, cache_dir)
+    # Get country shapes (already clipped to continental if requested)
+    country_shapes_gdf = download_country_shapes(countries, cache_dir, clip_to_continental=if_clip_coordiantes)
     combined_shape = join_shapes(country_shapes_gdf)
     
     # Rename country EL to GR for consistency
@@ -888,6 +916,9 @@ def get_voronoi(
     
     for shape, label in zip(shapes, shape_labels):
         # Get buses within this shape
+        if if_clip_coordiantes:
+            europes_extremes = Polygon([(-12,72),(40.3,72),(40.3,34),(-12,34)])
+            shape = mask_shape(shape, europes_extremes)
         if join:
             buses_in_shape = buses_filtered
         else:
