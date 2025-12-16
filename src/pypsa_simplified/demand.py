@@ -152,7 +152,14 @@ def calculate_population_voronoi(pop_path: str | Path, voronoi_path: str | Path,
     voronoi_csv['population'] = voronoi_gdf['population']
     voronoi_csv.to_csv(voronoi_csv_path, index=False)
     logger.info(f"Saved Voronoi population data to {voronoi_csv_path}.")
-                
+    
+    # Save also population variable as separate file with bus index and population only
+    pop_name = voronoi_path.name.replace('.parquet', '_population.csv')
+    pop_path = cashe_dir / pop_name
+    pop_df = voronoi_csv[['bus_id', 'population']]
+    pop_df.to_csv(pop_path, index=False)
+    logger.info(f"Saved population data to {pop_path}.")
+    
     # Return the whole GeoDataFrame with population column
     return voronoi_csv
 

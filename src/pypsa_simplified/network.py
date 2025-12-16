@@ -7,6 +7,8 @@ from shapely.wkt import loads
 import pandas as pd
 import geopandas as gpd
 import numpy as np
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 import pypsa
 import sys
@@ -16,6 +18,174 @@ SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.dirname(SCRIPT_DIR))
 
 from pypsa_simplified import data_prep as dp
+
+
+def _safe_cpu_workers() -> int:
+    """Choose a reasonable worker count without overcommitting cores."""
+    try:
+        # Keep one core free for the main process where possible.
+        return max(1, cpu_count() - 1)
+    except NotImplementedError:
+        return 1
+
+
+def _parallel_map(records: list[dict], func) -> list[dict]:
+    """Thin wrapper over Pool.map to keep invocation concise."""
+    if not records:
+        return []
+    with Pool(processes=_safe_cpu_workers()) as pool:
+        return pool.map(func, records)
+
+
+def _prepare_bus_add_kwargs(row: dict) -> dict:
+    try:
+        return {
+            "ok": True,
+            "name": row["bus_id"],
+            "kwargs": {
+                "name": row["bus_id"],
+                "x": float(row["x"]),
+                "y": float(row["y"]),
+                "country": row["country"],
+                "v_nom": float(row["voltage"]),
+                "carrier": "AC" if row["dc"] == "f" else "DC",
+                "under_construction": False if row["under_construction"] == "f" else True,
+            },
+        }
+    except Exception as error:  # Preserve original behavior: log a few errors only in caller
+        return {"ok": False, "name": row.get("bus_id"), "error": str(error)}
+
+
+def _prepare_line_add_kwargs(row: dict, ave_r_val: float, ave_x_val: float, ave_s_nom: float, ave_length: float, ave_b_val: float, ave_circuits: float) -> dict:
+    try:
+        r_val = float(row.get("r", ave_r_val)) if pd.notna(row.get("r")) and float(row.get("r", 0)) > 0 else ave_r_val
+        x_val = float(row.get("x", ave_x_val)) if pd.notna(row.get("x")) and float(row.get("x", 0)) > 0 else ave_x_val
+        s_nom_val = float(row.get("s_nom", ave_s_nom)) if pd.notna(row.get("s_nom")) else ave_s_nom
+        length_val = float(row.get("length", ave_length)) if pd.notna(row.get("length")) else ave_length
+        b_val = float(row.get("b", ave_b_val)) if pd.notna(row.get("b")) else ave_b_val
+        circuits = int(row.get("circuits", ave_circuits)) if pd.notna(row.get("circuits")) else ave_circuits
+
+        type_val = ""
+        if (
+            r_val == 0.01
+            and x_val == 0.1
+            and s_nom_val == 1000
+            and length_val == 100
+            and b_val == 100
+            and circuits == 1
+            and pd.notna(row.get("type"))
+            and str(row.get("type")).strip() != ""
+        ):
+            type_val = row["type"]
+
+        return {
+            "ok": True,
+            "name": row["line_id"],
+            "kwargs": {
+                "type": type_val,
+                "name": row["line_id"],
+                "bus0": row["bus0"],
+                "bus1": row["bus1"],
+                "x": x_val,
+                "r": r_val,
+                "b": b_val,
+                "s_nom": s_nom_val,
+                "length": length_val,
+                "num_parallel": circuits,
+                "carrier": "AC",
+            },
+        }
+    except Exception as error:
+        return {"ok": False, "name": row.get("line_id"), "error": str(error)}
+
+
+def _compute_trafo_impedance(v_in: float, v_out: float, s_nom: float) -> tuple[float, float]:
+    """Calculate per-unit series reactance (x) and resistance (r)."""
+    v_max = max(v_in, v_out)
+    if v_max >= 380:
+        x_pu = 0.15
+        base_x_r = 60.0
+    elif v_max >= 220:
+        x_pu = 0.12
+        base_x_r = 50.0
+    else:
+        x_pu = 0.10
+        base_x_r = 40.0
+
+    if s_nom > 1000:
+        x_r_ratio = min(base_x_r * 1.5, 90.0)
+    else:
+        x_r_ratio = base_x_r
+
+    r_pu = x_pu / x_r_ratio
+    r_pu = max(r_pu, 1e-5)
+    return x_pu, r_pu
+
+
+def _prepare_transformer_add_kwargs(row: dict, ave_s_nom: float) -> dict:
+    try:
+        s_nom_val = float(row.get("s_nom", ave_s_nom)) if pd.notna(row.get("s_nom")) else ave_s_nom
+        type_val = ""
+        if s_nom_val <= 0 or pd.isna(s_nom_val):
+            type_val = "Unknown"
+
+        v_bus0 = float(row.get("voltage_bus0", 220))
+        v_bus1 = float(row.get("voltage_bus1", 380))
+        x_val, r_val = _compute_trafo_impedance(v_bus0, v_bus1, s_nom_val)
+
+        return {
+            "ok": True,
+            "name": row["transformer_id"],
+            "kwargs": {
+                "name": row["transformer_id"],
+                "bus0": row["bus0"],
+                "bus1": row["bus1"],
+                "type": type_val,
+                "s_nom": s_nom_val,
+                "x": x_val,
+                "r": r_val,
+                "model": "t",
+            },
+        }
+    except Exception as error:
+        return {"ok": False, "name": row.get("transformer_id"), "error": str(error)}
+
+
+def _prepare_link_add_kwargs(row: dict, ave_p_nom: float) -> dict:
+    try:
+        p_nom_val = float(row.get("p_nom", ave_p_nom)) if pd.notna(row.get("p_nom")) else ave_p_nom
+        return {
+            "ok": True,
+            "name": row["link_id"],
+            "kwargs": {
+                "name": row["link_id"],
+                "bus0": row["bus0"],
+                "bus1": row["bus1"],
+                "p_nom": p_nom_val,
+                "efficiency": 1.0,
+                "carrier": "AC",
+            },
+        }
+    except Exception as error:
+        return {"ok": False, "name": row.get("link_id"), "error": str(error)}
+
+
+def _prepare_generator_add_kwargs(row: dict) -> dict:
+    try:
+        return {
+            "ok": True,
+            "name": row["Name"],
+            "kwargs": {
+                "name": row["Name"],
+                "bus": row["bus"],
+                "p_nom": float(row["p_nom"]),
+                "carrier": row["carrier"],
+                "efficiency": float(row.get("efficiency", 0.4)),
+                "marginal_cost": float(row.get("marginal_cost", 50.0)),
+            },
+        }
+    except Exception as error:
+        return {"ok": False, "name": row.get("Name"), "error": str(error)}
 
 G_CARRIERS = {
     "hard coal": {
@@ -154,19 +324,15 @@ def build_network(n: pypsa.Network, data_dict: dp.RawData, options: Dict[str, An
     
     print(f"Adding {len(buses)} buses...")
     
-    for idx, row in buses.iterrows():
-        voltage_kv = float(row['voltage'])  # Extract actual voltage from OSM data
-        
-        n.add(
-            "Bus",
-            name=row['bus_id'],
-            x=float(row['x']),
-            y=float(row['y']),
-            country=row['country'],
-            v_nom=voltage_kv,  # Use actual voltage level from OSM
-            carrier="AC" if row['dc'] == 'f' else "DC",  # All buses are AC by default; DC buses introduced via converters only
-            under_construction=False if row['under_construction'] == 'f' else True,
-        )
+    bus_results = _parallel_map(buses.to_dict("records"), _prepare_bus_add_kwargs)
+    bus_error_count = 0
+    for bus_result in bus_results:
+        if bus_result.get("ok"):
+            n.add("Bus", **bus_result["kwargs"])
+        else:
+            if bus_error_count < 3:
+                print(f"Error adding bus {bus_result.get('name')}: {bus_result.get('error')}")
+            bus_error_count += 1
     
     bus_ids_subset = set(buses['bus_id'].values)
 
@@ -185,47 +351,24 @@ def build_network(n: pypsa.Network, data_dict: dp.RawData, options: Dict[str, An
     ave_b_val = np.mean(lines['b'].dropna()) if not lines['b'].dropna().empty else 100
     ave_circuits = np.mean(lines['circuits'].dropna()) if not lines['circuits'].dropna().empty else 1
     
-    for idx, row in lines.iterrows():
-        try:
-            # Extract real line parameters from CSV, with fallbacks
-            r_val = float(row.get('r', ave_r_val)) if pd.notna(row.get('r')) and float(row.get('r', 0)) > 0 else ave_r_val
-            x_val = float(row.get('x', ave_x_val)) if pd.notna(row.get('x')) and float(row.get('x', 0)) > 0 else ave_x_val
-            s_nom_val = float(row.get('s_nom', ave_s_nom)) if pd.notna(row.get('s_nom')) else ave_s_nom
-            length_val = float(row.get('length', ave_length)) if pd.notna(row.get('length')) else ave_length
-            b_val = float(row.get('b', ave_b_val)) if pd.notna(row.get('b')) else ave_b_val
-            circuits = int(row.get('circuits', ave_circuits)) if pd.notna(row.get('circuits')) else ave_circuits
-
-            # If all above are default values, then:
-            type = ""
-            if (
-                r_val == 0.01
-                and x_val == 0.1
-                and s_nom_val == 1000
-                and length_val == 100
-                and b_val == 100
-                and circuits == 1
-                and pd.notna(row.get("type"))
-                and str(row.get("type")).strip() != ""
-            ):
-                type = row['type']
-
-            n.add(
-                "Line",
-                type=type,
-                name=row['line_id'],
-                bus0=row['bus0'],
-                bus1=row['bus1'],
-                x=x_val,
-                r=r_val,
-                b=b_val,
-                s_nom=s_nom_val,
-                length=length_val,
-                num_parallel=circuits,
-                carrier='AC'            # Lines implicitly operate at AC; carrier not a parameter but important for context
-            )
-        except Exception as e:
-            if idx < 3:  # Print first few errors only
-                print(f"Error adding line {row['line_id']}: {e}")
+    line_prepare = partial(
+        _prepare_line_add_kwargs,
+        ave_r_val=ave_r_val,
+        ave_x_val=ave_x_val,
+        ave_s_nom=ave_s_nom,
+        ave_length=ave_length,
+        ave_b_val=ave_b_val,
+        ave_circuits=ave_circuits,
+    )
+    line_results = _parallel_map(lines.to_dict("records"), line_prepare)
+    line_error_count = 0
+    for line_result in line_results:
+        if line_result.get("ok"):
+            n.add("Line", **line_result["kwargs"])
+        else:
+            if line_error_count < 3:
+                print(f"Error adding line {line_result.get('name')}: {line_result.get('error')}")
+            line_error_count += 1
     
     transformers = transformers[
         (transformers['bus0'].isin(bus_ids_subset)) &
@@ -237,91 +380,18 @@ def build_network(n: pypsa.Network, data_dict: dp.RawData, options: Dict[str, An
     # Averages for missing data
     ave_s_nom = np.mean(transformers['s_nom'].dropna()) if not transformers['s_nom'].dropna().empty else 50000
     
-    for idx, row in transformers.iterrows():
-        try:
-            # Extract transformer parameters
-            s_nom_val = float(row.get('s_nom', ave_s_nom)) if pd.notna(row.get('s_nom')) else ave_s_nom
-            
-            type = ''
-            if s_nom_val <= 0 or pd.isna(s_nom_val):
-                type = 'Unknown'
-            
-            # Voltage levels for base impedance calculation (if needed)
-            v_bus0 = float(row.get('voltage_bus0', 220))
-            v_bus1 = float(row.get('voltage_bus1', 380))
-            
-            def get_trafo_impedance(v_in, v_out, s_nom):
-                """
-                Calculates per-unit series reactance (x) and resistance (r) for 
-                European EHV transformers based on voltage level and nominal power.
-                
-                Parameters:
-                -----------
-                v_in, v_out : float
-                    Voltages on primary and secondary side in kV.
-                s_nom : float
-                    Nominal power in MVA.
-                    
-                Returns:
-                --------
-                (x_pu, r_pu) : tuple of floats
-                """
-                # 1. Determine Voltage Class (use the highest voltage)
-                v_max = max(v_in, v_out)
-                
-                # 2. Assign Standard Short Circuit Voltage (uk) -> x_pu
-                # Based on typical ENTSO-E / IEC standard values for European Grid
-                if v_max >= 380:      # 380/400 kV level
-                    x_pu = 0.15       # Typical range: 14-16%
-                    base_x_r = 60.0   # Very high efficiency
-                elif v_max >= 220:    # 220 kV level
-                    x_pu = 0.12       # Typical range: 12-14%
-                    base_x_r = 50.0   # High efficiency
-                else:                 # Fallback for unexpected lower voltages
-                    x_pu = 0.10
-                    base_x_r = 40.0
-
-                # 3. Adjust X/R ratio based on size (S_nom)
-                # Larger transformers are more efficient (higher X/R).
-                # We apply a logarithmic scaling to account for your large range [500, 25000].
-                # We saturate the scaling to avoid unrealistic values for aggregate transformers.
-                
-                # Scale factor: typically X/R increases with size. 
-                # For a 5000 MVA aggregate, we assume it behaves like multiple large units in parallel,
-                # so we keep the X/R of a large single unit (approx 60-80).
-                
-                if s_nom > 1000:
-                    # For huge aggregates, we cap the efficiency at the limit of physical large units
-                    x_r_ratio = min(base_x_r * 1.5, 90.0) 
-                else:
-                    # For smaller specific units, scale down slightly
-                    x_r_ratio = base_x_r
-                    
-                # 4. Calculate Resistance
-                # r is derived from x and the X/R ratio
-                r_pu = x_pu / x_r_ratio
-                
-                # Safety clamp for numerical stability in solvers (avoid exactly 0)
-                r_pu = max(r_pu, 1e-5)
-                
-                return x_pu, r_pu
-            
-            x_val, r_val = get_trafo_impedance(v_bus0, v_bus1, s_nom_val)
-            
-            n.add(
-                "Transformer",
-                name=row['transformer_id'],
-                bus0=row['bus0'],
-                bus1=row['bus1'],
-                type=type,
-                s_nom=s_nom_val,
-                x=x_val,
-                r=r_val,
-                model="t",  # T-model for transformers
-            )
-        except Exception as e:
-            if idx < 3:
-                print(f"Error adding transformer {row.get('transformer_id', 'unknown')}: {e}")
+    transformer_prepare = partial(_prepare_transformer_add_kwargs, ave_s_nom=ave_s_nom)
+    transformer_results = _parallel_map(transformers.to_dict("records"), transformer_prepare)
+    transformer_error_count = 0
+    for transformer_result in transformer_results:
+        if transformer_result.get("ok"):
+            n.add("Transformer", **transformer_result["kwargs"])
+        else:
+            if transformer_error_count < 3:
+                print(
+                    f"Error adding transformer {transformer_result.get('name', 'unknown')}: {transformer_result.get('error')}"
+                )
+            transformer_error_count += 1
     
     converters = converters.copy()
     
@@ -350,7 +420,7 @@ def build_network(n: pypsa.Network, data_dict: dp.RawData, options: Dict[str, An
                     y_coord = ac_bus['y']
                 except:
                     x_coord, y_coord = 0, 0
-                
+
                 n.add(
                     "Bus",
                     name=dc_bus_id,
@@ -359,10 +429,10 @@ def build_network(n: pypsa.Network, data_dict: dp.RawData, options: Dict[str, An
                     carrier="DC",
                     v_nom=float(row.get('voltage', 300)),  # DC voltage nominal
                 )
-            
+
             # Add converter as a Link
             p_nom_val = float(row.get('p_nom', ave_p_nom)) if pd.notna(row.get('p_nom')) else ave_p_nom
-            
+
             n.add(
                 "Link",
                 name=converter_id,
@@ -386,22 +456,16 @@ def build_network(n: pypsa.Network, data_dict: dp.RawData, options: Dict[str, An
 
     # Averages for missing data
     ave_p_nom = np.mean(links['p_nom'].dropna()) if not links['p_nom'].dropna().empty else 500
-    for idx, row in links.iterrows():
-        try:
-            p_nom_val = float(row.get('p_nom', ave_p_nom)) if pd.notna(row.get('p_nom')) else ave_p_nom
-            
-            n.add(
-                "Link",
-                name=row['link_id'],
-                bus0=row['bus0'],
-                bus1=row['bus1'],
-                p_nom=p_nom_val,
-                efficiency=1.0,  # No loss for simplified AC links (can adjust for realism)
-                carrier="AC",  # AC transmission
-            )
-        except Exception as e:
-            if idx < 3:
-                print(f"Error adding AC link {row.get('link_id', 'unknown')}: {e}")
+    link_prepare = partial(_prepare_link_add_kwargs, ave_p_nom=ave_p_nom)
+    link_results = _parallel_map(links.to_dict("records"), link_prepare)
+    link_error_count = 0
+    for link_result in link_results:
+        if link_result.get("ok"):
+            n.add("Link", **link_result["kwargs"])
+        else:
+            if link_error_count < 3:
+                print(f"Error adding AC link {link_result.get('name', 'unknown')}: {link_result.get('error')}")
+            link_error_count += 1
 
     # Additional options (CRS, snapshots, carriers) can be applied here
     return net
@@ -409,26 +473,18 @@ def build_network(n: pypsa.Network, data_dict: dp.RawData, options: Dict[str, An
 def add_generators(n: pypsa.Network, RawData: dp.RawData) -> pypsa.Network:
     """Add generators from the provided DataFrame into the PyPSA network."""
     generators_df = RawData.get('generators')
-        
+    
     RawData.bus_coords()
-        
-    for idx, row in generators_df.iterrows():
-        
-        
-        
-        try:
-            n.add(
-                "Generator",
-                name=row['Name'],
-                bus=row['bus'],
-                p_nom=float(row['p_nom']),
-                carrier=row['carrier'],
-                efficiency=float(row.get('efficiency', 0.4)),
-                marginal_cost=float(row.get('marginal_cost', 50.0)),
-            )
-        except Exception as e:
-            if idx < 3:
-                print(f"Error adding generator {row.get('generator_id', 'unknown')}: {e}")
+
+    generator_results = _parallel_map(generators_df.to_dict("records"), _prepare_generator_add_kwargs)
+    generator_error_count = 0
+    for generator_result in generator_results:
+        if generator_result.get("ok"):
+            n.add("Generator", **generator_result["kwargs"])
+        else:
+            if generator_error_count < 3:
+                print(f"Error adding generator {generator_result.get('name', 'unknown')}: {generator_result.get('error')}")
+            generator_error_count += 1
     return n
 
 
