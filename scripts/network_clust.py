@@ -810,6 +810,210 @@ def get_final_busmap(busmaps: dict[str, pd.Series]) -> pd.Series:
     return final_busmap
 
 
+def cluster_network_with_strategy(
+    n: pypsa.Network,
+    n_clusters: int,
+    cluster_weights: pd.Series,
+    strategy: str = "min_per_country",
+    min_per_country: int = 3,
+    focus_weights: dict | None = None,
+    alpha: float = 0.5,
+    algorithm: str = "kmeans",
+    aggregation_strategies: dict | None = None,
+    **algorithm_kwds,
+) -> tuple[pypsa.Network, pd.Series, pd.Series]:
+    """
+    Cluster network using various geographic diversity strategies.
+    
+    This is a high-level wrapper that implements different strategies for
+    distributing clusters across countries to ensure geographic representation.
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network to cluster (should be simplified first)
+    n_clusters : int
+        Target number of clusters
+    cluster_weights : pd.Series
+        Weights per bus (typically load)
+    strategy : str
+        Clustering strategy:
+        - "load_only": Pure load-weighted (baseline, concentrates in high-demand areas)
+        - "min_per_country": Ensure minimum clusters per country, then distribute by load
+        - "equal": Distribute clusters equally across countries
+        - "focus": Use focus_weights to boost specific countries
+        - "optimized": Use integer programming (requires linopy + solver)
+    min_per_country : int
+        Minimum clusters per country (for "min_per_country" strategy)
+    focus_weights : dict, optional
+        Country multipliers for "focus" strategy, e.g., {'PL': 2.0, 'ES': 1.5}
+    alpha : float
+        Geographic weight for hybrid features (not yet implemented)
+    algorithm : str
+        Clustering algorithm: "kmeans", "hac", "modularity"
+    aggregation_strategies : dict, optional
+        Custom aggregation strategies for clustering
+    **algorithm_kwds
+        Additional arguments for clustering algorithm
+        
+    Returns
+    -------
+    tuple[pypsa.Network, pd.Series, pd.Series]
+        - Clustered network
+        - Busmap (original bus → cluster bus)
+        - Cluster allocation (n_clusters per country/sub_network)
+        
+    Examples
+    --------
+    >>> # Strategy 1: Ensure all countries represented
+    >>> n_clust, busmap, allocation = cluster_network_with_strategy(
+    ...     n, 250, bus_loads, strategy="min_per_country", min_per_country=3
+    ... )
+    
+    >>> # Strategy 2: Boost Eastern Europe
+    >>> n_clust, busmap, allocation = cluster_network_with_strategy(
+    ...     n, 250, bus_loads, strategy="focus", 
+    ...     focus_weights={'PL': 2.5, 'RO': 2.0, 'CZ': 1.8}
+    ... )
+    
+    >>> # Strategy 3: Equal distribution
+    >>> n_clust, busmap, allocation = cluster_network_with_strategy(
+    ...     n, 250, bus_loads, strategy="equal"
+    ... )
+    """
+    logger.info(f"Clustering with strategy: {strategy}")
+    
+    # Distribute clusters based on strategy
+    if strategy == "load_only":
+        # Baseline: purely proportional to load
+        L = cluster_weights.groupby([n.buses.country, n.buses.sub_network]).sum()
+        L = L / L.sum()
+        N = n.buses.groupby(["country", "sub_network"]).size()[L.index]
+        n_clusters_c = (L * n_clusters).round().astype(int).clip(lower=1, upper=N)
+        
+        # Adjust to exact total
+        diff = n_clusters - n_clusters_c.sum()
+        if diff != 0:
+            sorted_idx = L.sort_values(ascending=(diff < 0)).index
+            for i in range(abs(diff)):
+                idx = sorted_idx[i % len(sorted_idx)]
+                if diff > 0 and n_clusters_c.loc[idx] < N.loc[idx]:
+                    n_clusters_c.loc[idx] += 1
+                elif diff < 0 and n_clusters_c.loc[idx] > 1:
+                    n_clusters_c.loc[idx] -= 1
+    
+    elif strategy == "min_per_country":
+        # Ensure minimum per country, distribute rest by load
+        L = cluster_weights.groupby([n.buses.country, n.buses.sub_network]).sum()
+        N = n.buses.groupby(['country', 'sub_network']).size()[L.index]
+        
+        # Initialize with minimum
+        n_clusters_c = pd.Series(
+            [min(min_per_country, N.loc[idx]) for idx in L.index], 
+            index=L.index
+        )
+        
+        # Distribute remaining proportionally
+        remaining = n_clusters - n_clusters_c.sum()
+        if remaining > 0:
+            L_norm = L / L.sum()
+            additional = (L_norm * remaining).round().astype(int)
+            additional = additional.clip(upper=N - n_clusters_c)
+            n_clusters_c += additional
+            
+            # Adjust for rounding
+            diff = n_clusters - n_clusters_c.sum()
+            if diff != 0:
+                sorted_idx = L.sort_values(ascending=(diff < 0)).index
+                for i in range(abs(diff)):
+                    idx = sorted_idx[i % len(sorted_idx)]
+                    if diff > 0 and n_clusters_c.loc[idx] < N.loc[idx]:
+                        n_clusters_c.loc[idx] += 1
+                    elif diff < 0 and n_clusters_c.loc[idx] > 1:
+                        n_clusters_c.loc[idx] -= 1
+    
+    elif strategy == "equal":
+        # Distribute equally across countries
+        groups = n.buses.groupby(['country', 'sub_network']).size()
+        n_groups = len(groups)
+        
+        base_per_group = n_clusters // n_groups
+        remainder = n_clusters % n_groups
+        
+        n_clusters_c = pd.Series(base_per_group, index=groups.index)
+        
+        if remainder > 0:
+            largest_groups = groups.sort_values(ascending=False).head(remainder).index
+            n_clusters_c.loc[largest_groups] += 1
+        
+        n_clusters_c = n_clusters_c.clip(upper=groups)
+    
+    elif strategy == "focus":
+        # Apply focus weights to boost specific countries
+        if focus_weights is None:
+            raise ValueError("focus_weights must be provided for 'focus' strategy")
+        
+        L = cluster_weights.groupby([n.buses.country, n.buses.sub_network]).sum()
+        
+        # Apply multipliers
+        for country, multiplier in focus_weights.items():
+            mask = L.index.get_level_values(0) == country
+            if mask.any():
+                L.loc[mask] *= multiplier
+                logger.info(f"  Boosted {country} by {multiplier}x")
+        
+        # Renormalize and distribute
+        L = L / L.sum()
+        N = n.buses.groupby(['country', 'sub_network']).size()[L.index]
+        n_clusters_c = (L * n_clusters).round().astype(int).clip(lower=1, upper=N)
+        
+        # Adjust to exact total
+        diff = n_clusters - n_clusters_c.sum()
+        if diff != 0:
+            sorted_idx = L.sort_values(ascending=(diff < 0)).index
+            for i in range(abs(diff)):
+                idx = sorted_idx[i % len(sorted_idx)]
+                if diff > 0 and n_clusters_c.loc[idx] < N.loc[idx]:
+                    n_clusters_c.loc[idx] += 1
+                elif diff < 0 and n_clusters_c.loc[idx] > 1:
+                    n_clusters_c.loc[idx] -= 1
+    
+    elif strategy == "optimized":
+        # Use integer programming (PyPSA-EUR method)
+        n_clusters_c = distribute_n_clusters_to_countries(
+            n, n_clusters, cluster_weights, 
+            focus_weights=focus_weights,
+            solver_name="gurobi"
+        )
+    
+    else:
+        raise ValueError(
+            f"Unknown strategy '{strategy}'. Must be one of: "
+            "load_only, min_per_country, equal, focus, optimized"
+        )
+    
+    # Log allocation
+    logger.info(f"Cluster allocation (top 10 countries):")
+    country_summary = n_clusters_c.groupby(level=0).sum().sort_values(ascending=False)
+    for country, n_clust in country_summary.head(10).items():
+        logger.info(f"  {country}: {n_clust} clusters")
+    
+    # Create busmap
+    busmap = busmap_for_n_clusters(
+        n, n_clusters_c, cluster_weights, 
+        algorithm=algorithm, **algorithm_kwds
+    )
+    
+    # Cluster network
+    clustering = clustering_for_n_clusters(n, busmap, aggregation_strategies)
+    
+    logger.info(
+        f"Clustering complete: {len(n.buses)} → {len(clustering.n.buses)} buses"
+    )
+    
+    return clustering.n, busmap, n_clusters_c
+
+
 # Example usage and testing
 if __name__ == "__main__":
     logger.info("Network clustering module loaded successfully")
@@ -819,5 +1023,7 @@ if __name__ == "__main__":
     logger.info("  - remove_stubs()")
     logger.info("  - distribute_n_clusters_to_countries() [uses Gurobi]")
     logger.info("  - busmap_for_n_clusters()")
-    logger.info("  - simplify_and_cluster_network() [main pipeline]")
+    logger.info("  - clustering_for_n_clusters()")
+    logger.info("  - cluster_network_with_strategy() [high-level wrapper]")
+    logger.info("  - simplify_and_cluster_network() [full pipeline]")
     logger.info("\nFor usage examples, see module docstrings.")

@@ -48,7 +48,7 @@ v_first_n = np.vectorize(lambda x, n: str(x)[:n])
 v_and = np.vectorize(lambda x, y: x and y)
 v_isbool = np.vectorize(lambda x,y: x==y)
 v_multiply = np.vectorize(lambda x,y: x*y)
-v_round = np.vectorize(lambda x, n: int(np.round(x, n)))
+v_round = np.vectorize(lambda x, n: float(np.round(x, n)))
 
 def get_population_grid(path: str | Path) -> pd.DataFrame:
     """Load population grid data from Eurostat and return as DataFrame."""
@@ -338,7 +338,7 @@ def _compute_demand_country(args: tuple) -> pd.DataFrame:
                     
         pop_share = float(pop_share)
         pd_series = v_multiply(series, pop_share)
-        pd_series = v_round(pd_series, 0)
+        pd_series = v_round(pd_series, 3)
         country_series[str(bus_id)] = pd_series
         
     return country_series
@@ -386,7 +386,7 @@ def compute_demand(voronoi_path: str | Path, load_data_path: str | Path) -> Path
     
     output_dir = repo_root / 'data' / 'processed'
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"voronoi_demand{'_join' if join else ''}.gzip"
+    output_path = output_dir / f"voronoi_demand{'_join' if join else ''}_f.gzip"
 
     logger.info(f"Saving demand data to {output_path}...")
     # labe demnad_out as parquet

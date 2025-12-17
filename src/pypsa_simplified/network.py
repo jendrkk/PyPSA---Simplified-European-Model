@@ -349,6 +349,7 @@ def _prepare_load_series(
 def add_loads_from_series(
     n: pypsa.Network,
     join: bool = True,
+    if_float: bool = False,
     extend_snapshots: bool = False,
     carrier: str = "AC",
     clip_non_negative: bool = False,
@@ -388,7 +389,7 @@ def add_loads_from_series(
     """
     
     repo_root = find_repo_root(Path(__file__).parent)
-    demand_dir = repo_root / 'data' / 'processed' / f"voronoi_demand{'_join' if join else ''}.gzip"
+    demand_dir = repo_root / 'data' / 'processed' / f"voronoi_demand{'_join' if join else ''}{'_f' if if_float else ''}.gzip"
     
     # Read demand data (columns: bus_id, demand_series)
     demand_df = pd.read_parquet(demand_dir, engine="pyarrow")
