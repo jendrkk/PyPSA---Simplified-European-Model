@@ -116,7 +116,7 @@ def calculate_population_voronoi(pop_path: str | Path, voronoi_path: str | Path,
     if voronoi_csv_path.exists():
         try:
             existing = pd.read_csv(voronoi_csv_path)
-            if 'population' in existing.columns and 'EU_population_share' in existing.columns:
+            if 'population' in existing.columns and 'EU_population_share' in existing.columns and False: # Disabled to always recompute just for now (later fix -> force recumpute not working because of this)
                 logger.info(f"Found existing population CSV at {voronoi_csv_path}; skipping computation.")
                 return existing
         except Exception:
@@ -151,7 +151,22 @@ def calculate_population_voronoi(pop_path: str | Path, voronoi_path: str | Path,
     
     voronoi_gdf['population'] = populations
     voronoi_gdf['EU_population_share'] = voronoi_gdf['population'] / voronoi_gdf['population'].sum()
-
+    
+    join = "_join" in voronoi_path.name
+    
+    if not join:
+        logger.info("Detected non-joined Voronoi cells; computing shares of country populations.")
+        voronoi_gdf['country_population_share'] = 0.0
+        country_populations = voronoi_gdf.groupby('country')['population'].sum().to_dict()
+        for idx, row in voronoi_gdf.iterrows():
+            country = row['country']
+            if country in country_populations and country_populations[country] > 0:
+                voronoi_gdf.at[idx, 'country_population_share'] = row['population'] / country_populations[country]
+            else:
+                voronoi_gdf.at[idx, 'country_population_share'] = 0.0
+    else:
+        logger.info("Detected joined Voronoi cells; skipping country population share computation.")
+    
     # Update or create CSV cache with population values
     try:
         if voronoi_csv_path.exists():
@@ -215,6 +230,7 @@ def execute_CPV(pop_path: str | Path, voronoi_path: str | Path, options: Dict = 
         end_time = dt.datetime.now()
         logger.info(f"Total computation time: {end_time - start_time}")
 
+'''
 def load_load_data(path: str | Path) -> pd.DataFrame:
     """Load load data from CSV file."""
     logger.info(f"Loading load data from {path}...")
@@ -296,7 +312,38 @@ def compute_demand(voronoi_path: str | Path, load_data_path: str | Path, output_
     
     # Save demand data
     save_load_data(demand_data, output_path)
+'''
+
+def _compute_demand_country(args: tuple) -> pd.DataFrame:
+    """Compute demand data for a single country."""
+    country, country_voronoi_pop, country_load_data, redistirbution = args
     
+    country_load_data = country_load_data.drop('country', axis=1)
+    
+
+
+def compute_demand(voronoi_path: str | Path, load_data_path: str | Path, output_path: str | Path):
+    """Compute demand data per Voronoi cell based on population and load data."""
+    # Load Voronoi parquet with population data
+    cashe_dir = geom.DEFAULT_CACHE_DIR
+    voronoi_parquet_path = cashe_dir / voronoi_path.name.replace('.parquet', '_P.parquet')
+    voronoi_gdf = geom.load_shapes_efficiently(voronoi_parquet_path)
+    
+    # Detect join
+    join = "_join" in voronoi_path.name
+    
+    # Countires in Voronoi cells
+    countries = voronoi_gdf['country'].unique().tolist()
+    
+    load_data_path = repo_root / "data" / "raw" / "energy_charts" / "combined_load_data.csv"
+    load_data = pd.read_csv(load_data_path, index_col=0, parse_dates=True)
+    
+    args_list = [(country, voronoi_gdf[voronoi_gdf['country'] == country], load_data[load_data['Country'] == country]) for country in countries]
+    
+    
+    
+    
+
 
 if __name__ == "__main__":
     def monitor_system(stop_event: threading.Event, interval: int = 10) -> None:

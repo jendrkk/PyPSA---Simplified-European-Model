@@ -12,6 +12,7 @@ import geometry as geom
 import pandas as pd
 from pathlib import Path
 import time
+import pytz
 from typing import List, Tuple, Union
 
 EU27: List[str] = geom.EU27
@@ -66,10 +67,9 @@ def json_to_dataframe(json_data: dict) -> pd.DataFrame:
     their `data` arrays. The function localizes timestamps to UTC and
     shifts them by one hour to align with CET/CEST as used by the source.
     """
-    timestamps = pd.to_datetime(json_data["unix_seconds"], unit="s")
+    tz = pytz.FixedOffset(60)
+    timestamps = pd.to_datetime(json_data["unix_seconds"], unit="s", utc = True).tz_convert(tz)
     df = pd.DataFrame(index=timestamps)
-    df.index = df.index.tz_localize("UTC")
-    df.index = df.index + pd.Timedelta(hours=1)
     df['Timestamp'] = df.index
     
     for prod_type in json_data.get("production_types", []):
@@ -145,6 +145,8 @@ def combine_all(countries: List[str], years: List[int], outpath: Union[Path, str
             file_path = outpath / filename
             if file_path.exists():
                 df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+                # Resample to 'h' frequency to ensure consistent timestamps
+                df = df.resample('h').mean()
                 if 'Load' in df.columns:
                     df_country = df[['Load']].copy()
                     df_country['Country'] = country
