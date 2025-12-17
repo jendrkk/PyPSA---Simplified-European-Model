@@ -909,14 +909,15 @@ def _process_voronoi_region(args):
     Parameters
     ----------
     args : tuple
-        (point_idx, region_idx, vor_regions, vor_vertices, points, bus_ids, shape, label)
+        (point_idx, region_idx, vor_regions, vor_vertices, points, bus_ids,
+         bus_countries, shape, label)
         
     Returns
     -------
     dict or None
         Voronoi cell data dict if successful, None otherwise
     """
-    point_idx, region_idx, vor_regions, vor_vertices, points, bus_ids, shape, label = args
+    point_idx, region_idx, vor_regions, vor_vertices, points, bus_ids, bus_countries, shape, label = args
     
     region = vor_regions[region_idx]
     
@@ -937,6 +938,7 @@ def _process_voronoi_region(args):
                         'bus_x': points[point_idx, 0],
                         'bus_y': points[point_idx, 1],
                         'region': label,
+                        'country': bus_countries[point_idx],
                         'area_km2': get_shape_area(clipped, unit='km2'),
                         'bounded': False
                     }
@@ -962,6 +964,7 @@ def _process_voronoi_region(args):
                 'bus_x': points[point_idx, 0],
                 'bus_y': points[point_idx, 1],
                 'region': label,
+                'country': bus_countries[point_idx],
                 'area_km2': get_shape_area(clipped, unit='km2'),
                 'bounded': True
             }
@@ -1000,9 +1003,14 @@ def _process_single_shape_voronoi(args):
     if len(buses_in_shape) < 1:
         return []
     
-    # Extract coordinates
+    # Extract coordinates and per-bus country
     points = buses_in_shape[['x', 'y']].values
     bus_ids = buses_in_shape['bus_id'].values
+    bus_countries = (
+        buses_in_shape['country'].values
+        if 'country' in buses_in_shape.columns
+        else np.array([None] * len(buses_in_shape), dtype=object)
+    )
     num_real_points = len(points)
     
     # Add mirror points to bound Voronoi cells
@@ -1027,8 +1035,8 @@ def _process_single_shape_voronoi(args):
     
     # Process Voronoi regions in parallel
     process_args = [
-        (point_idx, vor.point_region[point_idx], vor.regions, vor.vertices, 
-         points, bus_ids, shape, label)
+        (point_idx, vor.point_region[point_idx], vor.regions, vor.vertices,
+         points, bus_ids, bus_countries, shape, label)
         for point_idx in range(num_real_points)
     ]
     
@@ -1068,6 +1076,7 @@ def _process_single_shape_voronoi(args):
                     'bus_x': points[idx, 0],
                     'bus_y': points[idx, 1],
                     'region': label,
+                    'country': bus_countries[idx],
                     'area_km2': get_shape_area(clipped, unit='km2'),
                     'bounded': False
                 })
@@ -1228,6 +1237,7 @@ def get_voronoi(
     mapping_df = pd.DataFrame({
         'bus_id': voronoi_gdf['bus_id'],
         'region': voronoi_gdf['region'],
+        'country': voronoi_gdf.get('country'),
         'area_km2': voronoi_gdf['area_km2'],
         'bus_x': voronoi_gdf['bus_x'],
         'bus_y': voronoi_gdf['bus_y'],

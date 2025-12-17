@@ -322,10 +322,15 @@ if __name__ == "__main__":
 
 
     def main():
+        """
+        Main function to compute population and demand data.
+        """
+        
         # Ask if we want a joined version or not
-        join = input('Compute population data for joined Voronoi cells? (T/F): ').strip().lower()
+        force_download = input("Force recomputation of population data? (y/N): ").strip().lower() == 'y'
+        join = input('Compute population data for joined Voronoi cells? (y/N): ').strip().lower() == 'y'
         pop_path = repo_root / 'data' / 'processed' / 'jrc_population_nonzero.parquet'
-        voronoi_path = geom.DEFAULT_CACHE_DIR / Path(f"voronoi_eu27{'_join' if join == 't' else ''}.parquet")
+        voronoi_path = geom.DEFAULT_CACHE_DIR / Path(f"voronoi_eu27{'_join' if join else ''}.parquet")
 
         # Ensure voronoi_path is a Path
         voronoi_path = Path(voronoi_path)
@@ -333,16 +338,17 @@ if __name__ == "__main__":
         # If the voronoi population CSV does not exist in cache, create it first
         cashe_dir = geom.DEFAULT_CACHE_DIR
         pop_csv = cashe_dir / voronoi_path.name.replace('.parquet', '_population.csv')
-        if not pop_csv.exists():
+        if not pop_csv.exists() or force_download:
             execute_CPV(pop_path, voronoi_path)
         else:
             logger.info(f"Population data for {voronoi_path} already exists at {pop_csv}. Skipping computation.")
-
+            
+        force_demand = input("Compute demand data now? (y/N): ").strip().lower() == 'y'
         # After population exists, compute demand data and save to processed folder (skip if exists)
         demand_out = repo_root / 'data' / 'processed' / f"demand_{voronoi_path.stem}.csv"
-        if not demand_out.exists():
+        if not demand_out.exists() or force_demand:
             try:
-                compute_demand(voronoi_path, repo_root / 'data' / 'raw' / 'time_series_60min_singleindex_filtered.csv', demand_out)
+                (voronoi_path, repo_root / 'data' / 'raw' / 'time_series_60min_singleindex_filtered.csv', demand_out)
                 logger.info(f"Demand data saved to {demand_out}.")
             except Exception as exc:
                 logger.warning(f"Failed to compute demand data: {exc}")
