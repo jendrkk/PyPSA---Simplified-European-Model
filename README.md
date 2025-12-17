@@ -9,6 +9,7 @@ This repository has been refactored to move heavy logic into `src/pypsa_simplifi
 - `src/pypsa_simplified/remote.py`: SSH file transfer and remote execution helpers (password prompt supported).
 - `src/pypsa_simplified/env_install.py`: Detect/install required packages on server or print exact conda commands.
 - `src/pypsa_simplified/run_opt.py`: CLI for running optimization on the server.
+- `src/pypsa_simplified/demand.py`: Per-bus demand time series processing and Voronoi tessellation mapping.
 - **`scripts/geometry.py`**: European geographical data handling (countries, NUTS-3, Voronoi diagrams).
 - **`scripts/bus_filtering.py`**: Utilities for filtering power network buses by geography.
 
@@ -68,6 +69,14 @@ Full documentation is available in [`scripts/docs/`](scripts/docs/):
 - **[GETTING_STARTED.md](scripts/docs/GETTING_STARTED.md)**: Step-by-step tutorial
 - **[QUICK_REFERENCE.md](scripts/docs/QUICK_REFERENCE.md)**: Code snippets and examples
 - **[ARCHITECTURE.md](scripts/docs/ARCHITECTURE.md)**: Design decisions and caching system
+
+## Demand Data Format
+
+Load time series data is stored in `data/processed/voronoi_demand.gzip` and `voronoi_demand_join.gzip` as parquet files with the following structure:
+- **Columns**: `bus_id` (str), `demand_series` (list of floats)
+- **Time Range**: 87672 hourly values from 2015-01-01 00:00:00 to 2024-12-31 23:00:00 (UTC)
+- **Timezone**: All timestamps are UTC (timezone-naive)
+- **Usage**: The `add_loads_from_series()` function in `network.py` reads this format and converts each list to a pandas Series with proper UTC timestamps before adding loads to the PyPSA network.
 
 ## Notebook workflow
 - `notebooks/01_data_preparation.ipynb`: Prepares `data/processed/source.json.gz`.

@@ -138,8 +138,8 @@ def _download_file(url: str, output_path: Path, force: bool = False) -> Path:
 
 
 def download_country_shapes(
-    countries: Optional[List[str]] = None,
-    cache_dir: Optional[Path] = None,
+    countries: Optional[List[str]] = EU27,
+    cache_dir: Optional[Path] = DEFAULT_CACHE_DIR,
     force_download: bool = False,
     clip_to_continental: bool = True
 ) -> gpd.GeoDataFrame:
@@ -212,8 +212,8 @@ def download_country_shapes(
 
 
 def download_nuts3_shapes(
-    countries: Optional[List[str]] = None,
-    cache_dir: Optional[Path] = None,
+    countries: Optional[List[str]] = EU27,
+    cache_dir: Optional[Path] = DEFAULT_CACHE_DIR,
     force_download: bool = False,
     clip_to_continental: bool = True
 ) -> gpd.GeoDataFrame:
@@ -295,6 +295,89 @@ def download_nuts3_shapes(
     
     return gdf
 
+def download_nuts2_shapes(
+    countries: Optional[List[str]] = EU27,
+    cache_dir: Optional[Path] = DEFAULT_CACHE_DIR,
+    force_download: bool = False,
+    clip_to_continental: bool = True
+) -> gpd.GeoDataFrame:
+    """
+    Download NUTS-3 region shapes for Europe from Eurostat GISCO.
+    
+    If the data is already cached locally, it will be loaded from cache
+    unless force_download is True.
+    
+    NUTS (Nomenclature of Territorial Units for Statistics) is a standard
+    for referencing administrative divisions in Europe.
+    
+    Parameters
+    ----------
+    countries : list of str, optional
+        List of ISO 2-letter country codes to filter by. If None, returns all regions.
+    cache_dir : Path, optional
+        Directory for caching downloaded data
+    force_download : bool
+        If True, re-download even if cached
+    clip_to_continental : bool
+        If True, clip shapes to continental Europe (EUROPE_EXTREME_POINTS)
+        
+    Returns
+    -------
+    gpd.GeoDataFrame
+        GeoDataFrame with NUTS-2 geometries in EPSG:4326
+        Columns include: NUTS_ID, CNTR_CODE, NAME_LATN, LEVL_CODE, geometry
+        
+    Examples
+    --------
+    >>> # Download all NUTS-3 regions
+    >>> nuts3 = download_nuts3_shapes()
+    >>> 
+    >>> # Download NUTS-3 for Germany and Poland
+    >>> nuts3_de_pl = download_nuts3_shapes(['DE', 'PL'])
+    >>> 
+    >>> # Get only NUTS-3 level (level 2)
+    >>> nuts3_only = nuts3[nuts3['LEVL_CODE'] == 2]
+    """
+    cache_dir = _ensure_cache_dir(cache_dir)
+    cache_file = cache_dir / "nuts_regions.geojson"
+    
+    # Download or use cached file
+    if not cache_file.exists() or force_download:
+        _download_file(NUTS_URL, cache_file, force=force_download)
+    
+    # Load data
+    gdf = gpd.read_file(cache_file)
+    
+    # Filter for NUTS-2 level only (LEVL_CODE == 2)
+    if 'LEVL_CODE' in gdf.columns:
+        gdf = gdf[gdf['LEVL_CODE'] == 2].copy()
+    
+    # Standardize country codes (EL -> GR, UK -> GB)
+    if 'CNTR_CODE' in gdf.columns:
+        gdf.loc[gdf['CNTR_CODE'] == 'EL', 'CNTR_CODE'] = 'GR'
+        gdf.loc[gdf['CNTR_CODE'] == 'UK', 'CNTR_CODE'] = 'GB'
+    
+    if 'NUTS_ID' in gdf.columns:
+        gdf['NUTS_ID'] = gdf['NUTS_ID'].str.replace('EL', 'GR').str.replace('UK', 'GB')
+    
+    # Filter by countries if specified
+    if countries is not None:
+        gdf = gdf[gdf['CNTR_CODE'].isin(countries)].copy()
+    
+    # Ensure CRS
+    if gdf.crs != GEO_CRS:
+        gdf = gdf.to_crs(GEO_CRS)
+    
+    # Clip to continental Europe if requested
+    if clip_to_continental:
+        gdf['geometry'] = gdf.geometry.intersection(EUROPE_EXTREME_POINTS)
+        # Remove empty geometries
+        gdf = gdf[~gdf.geometry.is_empty].copy()
+        logger.info(f"Clipped to continental Europe: {len(gdf)} NUTS-3 region shapes remain")
+    else:
+        logger.info(f"Loaded {len(gdf)} NUTS-3 region shapes")
+    
+    return gdf
 
 def join_shapes(
     shapes: Union[gpd.GeoDataFrame, List[Union[Polygon, MultiPolygon]]],
@@ -1272,11 +1355,18 @@ if __name__ == "__main__":
     print(f"   File size: {countries_path.stat().st_size / 1024:.1f} KB\n")
     
     # 2. Download all NUTS-3 regions
-    print("Step 2/4: Downloading all NUTS-3 regions...")
+    print("Step 2A/4: Downloading all NUTS-3 regions...")
     all_nuts3 = download_nuts3_shapes()
     nuts3_path = save_shapes_efficiently(all_nuts3, cache_dir / "all_nuts3")
     print(f"   ✓ Saved {len(all_nuts3)} NUTS-3 regions to {nuts3_path}")
     print(f"   File size: {nuts3_path.stat().st_size / 1024:.1f} KB\n")
+    
+     # 2. Download all NUTS-2 regions
+    print("Step 2B/4: Downloading all NUTS-2 regions...")
+    all_nuts2 = download_nuts2_shapes()
+    nuts2_path = save_shapes_efficiently(all_nuts2, cache_dir / "all_nuts2")
+    print(f"   ✓ Saved {len(all_nuts2)} NUTS-2 regions to {nuts2_path}")
+    print(f"   File size: {nuts2_path.stat().st_size / 1024:.1f} KB\n")
     
     # 3. Try to load buses and create Voronoi diagrams
     print("Step 3/4: Creating Voronoi diagrams for EU27 buses...")

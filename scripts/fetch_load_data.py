@@ -13,6 +13,7 @@ import pandas as pd
 from pathlib import Path
 import time
 import pytz
+import numpy as np
 from typing import List, Tuple, Union
 
 EU27: List[str] = geom.EU27
@@ -161,6 +162,264 @@ def combine_all(countries: List[str], years: List[int], outpath: Union[Path, str
     combined_filename = outpath / "combined_load_data.csv"
     combined_df.to_csv(combined_filename)
 
+def find_missing_ranges(df: pd.DataFrame, n_missing: int = 6) -> List[Tuple]:
+    """Find consecutive missing values in the 'Load' column if there are more than n_missing in a row.
+    
+    Parameters
+    - df: DataFrame with 'Load' column
+    - n_missing: minimum number of consecutive missing values to report
+    
+    Returns
+    - List of tuples (start_timestamp, end_timestamp) for missing ranges
+    """
+    missing_ranges = []
+    in_missing = False
+    start_missing = None
+    missing_count = 0
+
+    for idx, row in df.iterrows():
+        if pd.isna(row['Load']):
+            if not in_missing:
+                in_missing = True
+                start_missing = idx
+            missing_count += 1
+        else:
+            if in_missing:
+                if missing_count >= n_missing:
+                    missing_ranges.append((start_missing, idx))
+                in_missing = False
+                missing_count = 0
+
+    # Check if we ended while still in a missing range
+    if in_missing and missing_count >= n_missing:
+        missing_ranges.append((start_missing, df.index[-1]))
+
+    return missing_ranges
+
+
+def process_load_data(load_df: pd.DataFrame) -> pd.DataFrame:
+    """Process combined load data with UTC conversion and missing value handling.
+    
+    Takes load data from combine_all (in long format with CET timestamps), converts to UTC,
+    handles special cases for UK and IE, fills remaining missing values with time interpolation.
+    
+    Parameters
+    - load_df: DataFrame from combine_all with structure:
+        - Index: 'Timestamp' (in CET), 'Country' (multi-index)
+        - Columns: 'Load'
+    
+    Returns
+    - DataFrame with columns: 'Timestamp', 'Country', 'Load', 'Missing'
+      - Timestamp: UTC timezone, from 2015-01-01 00:00:00+00:00 to 2024-12-31 23:00:00+00:00
+      - Country: ISO2 country codes
+      - Load: Hourly electricity load (no missing values except where originally all missing)
+      - Missing: Boolean indicating if the Load value was originally missing
+    """
+    # Reset index to work with long format
+    load_df = load_df.reset_index()
+    
+    # Convert from CET (GMT+1) to UTC
+    cet_tz = pytz.FixedOffset(60)  # CET is GMT+1
+    load_df['Timestamp'] = pd.to_datetime(load_df['Timestamp'])
+    load_df['Timestamp'] = load_df['Timestamp'].dt.tz_convert(cet_tz)
+    load_df['Timestamp'] = load_df['Timestamp'].dt.tz_convert('UTC')
+    
+    # Create complete time range in UTC
+    time_2015_to_2024 = pd.date_range(
+        start='2015-01-01', 
+        end='2024-12-31 23:00', 
+        freq='h', 
+        tz='UTC'
+    )
+    
+    # Process each country
+    df_result = pd.DataFrame()
+    unique_countries = load_df['Country'].unique()
+    
+    for country in unique_countries:
+        newdf = pd.DataFrame()
+        newdf.index = time_2015_to_2024
+        newdf.index.name = 'Timestamp'
+        newdf['Country'] = country
+        
+        # Get country-specific load data
+        country_load_data = load_df[load_df['Country'] == country].copy()
+        country_load_data = country_load_data.drop('Country', axis=1)
+        country_load_data['Missing'] = country_load_data['Load'].isna()
+        country_load_data = country_load_data.set_index('Timestamp')
+        
+        # Merge with the complete time range
+        newdf = newdf.merge(country_load_data, left_index=True, right_index=True, how='left')
+        
+        # Special handling for UK
+        if country == 'UK':
+            # Scale UK data for specific time periods based on historical data
+            newdf.loc[(newdf.index >= '2021-06-14 08:00:00+00:00') & 
+                      (newdf.index <= '2022-06-14 07:00:00+00:00'), 'Load'] = \
+                np.array(newdf.loc[(newdf.index >= '2020-06-14 08:00:00+00:00') & 
+                                   (newdf.index <= '2021-06-14 07:00:00+00:00'), 'Load'].values) * 0.975
+            
+            newdf.loc[(newdf.index >= '2022-06-14 08:00:00+00:00') & 
+                      (newdf.index <= '2023-06-14 07:00:00+00:00'), 'Load'] = \
+                np.array(newdf.loc[(newdf.index >= '2020-06-14 08:00:00+00:00') & 
+                                   (newdf.index <= '2021-06-14 07:00:00+00:00'), 'Load'].values) * 0.95
+            
+            newdf.loc[(newdf.index >= '2023-06-14 08:00:00+00:00') & 
+                      (newdf.index <= '2024-02-28 23:00:00+00:00'), 'Load'] = \
+                np.array(newdf.loc[(newdf.index >= '2020-06-14 08:00:00+00:00') & 
+                                   (newdf.index <= '2021-02-28 23:00:00+00:00'), 'Load'].values) * 0.91
+            
+            newdf.loc[(newdf.index >= '2024-02-29 00:00:00+00:00') & 
+                      (newdf.index <= '2024-02-29 23:00:00+00:00'), 'Load'] = \
+                np.array(newdf.loc[(newdf.index >= '2024-02-28 00:00:00+00:00') & 
+                                   (newdf.index <= '2024-02-28 23:00:00+00:00'), 'Load'].values) * 1.0
+            
+            newdf.loc[(newdf.index >= '2024-03-01 00:00:00+00:00') & 
+                      (newdf.index <= '2024-06-14 07:00:00+00:00'), 'Load'] = \
+                np.array(newdf.loc[(newdf.index >= '2021-03-01 00:00:00+00:00') & 
+                                   (newdf.index <= '2021-06-14 07:00:00+00:00'), 'Load'].values) * 0.91
+            
+            newdf.loc[(newdf.index >= '2024-06-14 08:00:00+00:00') & 
+                      (newdf.index <= '2024-12-31 23:00:00+00:00'), 'Load'] = \
+                np.array(newdf.loc[(newdf.index >= '2020-06-14 08:00:00+00:00') & 
+                                   (newdf.index <= '2020-12-31 23:00:00+00:00'), 'Load'].values) * 0.91
+            
+            newdf['Load'] = newdf['Load'].interpolate(method='time')
+            df_result = pd.concat([df_result, newdf])
+            continue
+        
+        # If all values are missing for a country, skip special processing
+        if newdf['Load'].isna().all():
+            df_result = pd.concat([df_result, newdf])
+            continue
+        
+        # Special handling.
+        miss = find_missing_ranges(newdf, 6)
+        if len(miss) > 0:
+            for start, end in miss:
+                leng = (end - start).total_seconds() / 3600
+                print(f"Missing range for {country} from {start} to {end}, length: {leng} hours")
+                previous_day_start = start - pd.DateOffset(days=1)
+                previous_day_end = end - pd.DateOffset(days=1)
+                
+                feasible = previous_day_end in time_2015_to_2024 and previous_day_start in time_2015_to_2024
+                # Try filling from previous day
+                if newdf.loc[previous_day_start:previous_day_end, 'Load'].isna().sum() <= 1 and feasible:
+                    if len(newdf.loc[start:end, 'Load']) != len(newdf.loc[previous_day_start:previous_day_end, 'Load']):
+                        print(f"Length of current missing data: {len(newdf.loc[start:end, 'Load'])} hours")
+                        print(f"Length of previous day data: {len(newdf.loc[previous_day_start:previous_day_end, 'Load'])} hours")
+                    newdf.loc[start:end, 'Load'] = newdf.loc[previous_day_start:previous_day_end, 'Load'].values
+                    print(f"Filled missing range for {country} from {start} to {end} using previous day's data")
+                    continue
+                
+                # Try filling from next day
+                next_day_start = start + pd.DateOffset(days=1)
+                next_day_end = end + pd.DateOffset(days=1)
+                
+                feasible = next_day_end in time_2015_to_2024 and next_day_start in time_2015_to_2024
+                if newdf.loc[next_day_start:next_day_end, 'Load'].isna().sum() <= 1 and feasible:
+                    if len(newdf.loc[start:end, 'Load']) != len(newdf.loc[next_day_start:next_day_end, 'Load']):
+                        print(f"Length of current missing data: {len(newdf.loc[start:end, 'Load'])} hours")
+                        print(f"Length of next day data: {len(newdf.loc[next_day_start:next_day_end, 'Load'])} hours")
+                    newdf.loc[start:end, 'Load'] = newdf.loc[next_day_start:next_day_end, 'Load'].values
+                    print(f"Filled missing range for {country} from {start} to {end} using next day's data")
+                    continue
+                
+                # Try filling from same time last year
+                previous_year_start = start - pd.DateOffset(years=1)
+                previous_year_end = end - pd.DateOffset(years=1)
+                prev_year = newdf.loc[previous_year_start:previous_year_end]
+                
+                feasible = previous_year_end in time_2015_to_2024 and previous_year_start in time_2015_to_2024
+                if find_missing_ranges(prev_year, 6) == [] and feasible:
+                    a = len(newdf.loc[start:end, 'Load'])
+                    b = len(newdf.loc[previous_year_start:previous_year_end, 'Load'])
+                    
+                    if a != b:
+                        # Handling leap year mismatch
+                        if a > b:
+                            # Current missing data is longer (filling Feb 29)
+                            newdf.loc[start:end, 'Load'] = np.concatenate([
+                                newdf.loc[previous_year_start:previous_year_end, 'Load'].values,
+                                np.full((a - b,), newdf.loc[previous_year_end, 'Load'])
+                            ])
+                        else:
+                            # Previous year data is longer
+                            newdf.loc[start:end, 'Load'] = newdf.loc[
+                                previous_year_start:previous_year_end - pd.DateOffset(hours=(b - a)), 'Load'
+                            ].values
+                    else:
+                        newdf.loc[start:end, 'Load'] = newdf.loc[previous_year_start:previous_year_end, 'Load'].values
+                    
+                    print(f"Filled missing range for {country} from {start} to {end} using previous year's data")
+                    continue
+                
+                # Try filling from same time next year
+                next_year_start = start + pd.DateOffset(years=1)
+                next_year_end = end + pd.DateOffset(years=1)
+                next_year = newdf.loc[next_year_start:next_year_end]
+                
+                feasible = next_year_end in time_2015_to_2024 and next_year_start in time_2015_to_2024
+                if find_missing_ranges(next_year, 6) == [] and feasible:
+                    a = len(newdf.loc[start:end, 'Load'])
+                    b = len(newdf.loc[next_year_start:next_year_end, 'Load'])
+                    
+                    if a != b:
+                        # Handling leap year mismatch
+                        if a > b:
+                            # Current missing data is longer (filling Feb 29)
+                            newdf.loc[start:end, 'Load'] = np.concatenate([
+                                newdf.loc[next_year_start:next_year_end, 'Load'].values,
+                                np.full((a - b,), newdf.loc[next_year_end, 'Load'])
+                            ])
+                        else:
+                            # Previous year data is longer
+                            newdf.loc[start:end, 'Load'] = newdf.loc[
+                                next_year_start:next_year_end - pd.DateOffset(hours=(b - a)), 'Load'
+                            ].values
+                    else:
+                        newdf.loc[start:end, 'Load'] = newdf.loc[next_year_start:next_year_end, 'Load'].values
+                    
+                    print(f"Filled missing range for {country} from {start} to {end} using previous year's data")
+                    continue
+                
+                # If not possible, give a warning
+                print(f"⚠ Could not fill missing range for {country} from {start} to {end}")
+            
+            df_result = pd.concat([df_result, newdf])
+            continue
+        
+        # Fill missing values with linear time interpolation for all other countries
+        newdf['Load'] = newdf['Load'].interpolate(method='time')
+        df_result = pd.concat([df_result, newdf])
+    
+    # Reset index and prepare final output
+    countries = df_result['Country'].unique()
+    if len(countries) != 28:
+        print(f"Warning: Expected 28 countries, found {len(countries)} countries.")
+    # Interpolate again to ensure no missing values remain after all processing
+    for country in countries:
+        mask = df_result['Country'] == country
+        df_result.loc[mask, 'Load'] = df_result.loc[mask, 'Load'].interpolate(method='time')
+        # Final check for any remaining missing values
+        if df_result.loc[mask, 'Load'].isna().any():
+            # Interpolate with nearest if any missing values remain
+            df_result.loc[mask, 'Load'] = df_result.loc[mask, 'Load'].interpolate(method='nearest')
+            print(f"Warning: Used nearest interpolation for remaining missing values in {country}.")
+    
+    # At the end we are summing up all countries per timestamp and create "EU" entries
+    eu_df = df_result.groupby('Timestamp')['Load'].sum().reset_index()
+    eu_df['Country'] = 'EU'
+    eu_df['Missing'] = False  # EU total should not have missing values after interpolation
+    df_result = pd.concat([df_result, eu_df], ignore_index=True)
+    
+    df_result = df_result.reset_index()
+    df_result = df_result[['Timestamp', 'Country', 'Load', 'Missing']]
+    df_result = df_result.sort_values(['Timestamp', 'Country']).reset_index(drop=True)
+    
+    return df_result
+
+
 def main():
     force_donwload = input("Force download all data? (y/n): ").strip().lower() == 'y'
     countries = EU27
@@ -189,5 +448,10 @@ def main():
         print(default_outpath)
         combine_all(countries, years, default_outpath)
         print("Combined files have been created.")
+        combined_df = pd.read_csv(default_outpath / "combined_load_data.csv", index_col=0, parse_dates=True)
+        processed_df = process_load_data(combined_df)
+        processed_df.to_csv(default_outpath / "processed_load_data.csv", index=False)
+        print("Processed load data has been saved.")
+
 if __name__ == "__main__":
     main()

@@ -25,6 +25,9 @@ _lazy_map = {
 	"build_network_from_serialized_source": "pypsa_simplified.network",
 	"optimize_network": "pypsa_simplified.network",
 	"network_summary": "pypsa_simplified.network",
+	"add_loads_from_series": "pypsa_simplified.network",
+	"add_generators": "pypsa_simplified.network",
+	"save_network": "pypsa_simplified.network",
 	# data prep
 	"prepare_osm_source": "pypsa_simplified.data_prep",
 	"prepare_generator_data": "pypsa_simplified.data_prep",

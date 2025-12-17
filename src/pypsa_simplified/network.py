@@ -13,12 +13,34 @@ from functools import partial
 import pypsa
 import sys
 import os
+import logging
+from pathlib import Path
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.dirname(SCRIPT_DIR))
 
 from pypsa_simplified import data_prep as dp
 
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Add src to path for data_prep import
+def find_repo_root(start_path: Path, max_up: int = 6) -> Path:
+    """Find repository root by searching upward for README.md or .git"""
+    p = start_path.resolve()
+    for _ in range(max_up):
+        if (p / 'README.md').exists() or (p / '.git').exists():
+            return p
+        if p.parent == p:
+            break
+        p = p.parent
+    return start_path.resolve()
+
+repo_root = find_repo_root(Path(__file__).parent)
+src_path = repo_root / 'scripts'
+if str(src_path) not in sys.path:
+    sys.path.insert(1, str(src_path))
 
 def _safe_cpu_workers() -> int:
     """Choose a reasonable worker count without overcommitting cores."""
@@ -270,17 +292,20 @@ T_CARRIERS = {
 
 
 def _prepare_load_series(
-    record: tuple[str, pd.Series],
+    record: dict,
     snapshots: pd.DatetimeIndex,
+    default_timestamps: pd.DatetimeIndex,
     clip_non_negative: bool = False,
 ) -> dict:
     """Prepare a single load time series for insertion.
 
     Parameters
-    record: (bus_id, series)
-        Tuple with the bus identifier and its demand series.
+    record: dict
+        Dictionary with 'bus_id' (str) and 'demand_series' (list of floats).
     snapshots: pd.DatetimeIndex
         Target snapshots to align the series to.
+    default_timestamps: pd.DatetimeIndex
+        Default timestamps in UTC corresponding to the demand_series list.
     clip_non_negative: bool
         If True, negative values are clipped to zero.
 
@@ -288,21 +313,25 @@ def _prepare_load_series(
     dict: Mapping with fields: ok, bus, name, p_set (pd.Series) or error.
 
     Notes
-    - Timezone-aware indices are converted to timezone-naive.
+    - demand_series list is converted to pd.Series with default_timestamps as index.
     - Series are reindexed to `snapshots`, filling missing with 0.
+    - All timestamps remain in UTC.
     """
     try:
-        bus_id, ser = record
-        if not isinstance(ser.index, pd.DatetimeIndex):
+        bus_id = record['bus_id']
+        demand_list = record['demand_series']
+        
+        if not isinstance(demand_list, list):
             raise TypeError(
-                f"Demand series for bus {bus_id} must have DatetimeIndex."
+                f"Demand series for bus {bus_id} must be a list of floats."
             )
-
-        if ser.index.tz is not None:
-            ser.index = ser.index.tz_localize(None)
-
-        ser = ser.sort_index()
+        
+        # Convert list to Series with default_timestamps as index (UTC)
+        ser = pd.Series(demand_list, index=default_timestamps, dtype=float)
+        
+        # Reindex to target snapshots
         ser = ser.reindex(snapshots, fill_value=0.0)
+        
         if clip_non_negative:
             ser = ser.clip(lower=0.0)
 
@@ -313,13 +342,12 @@ def _prepare_load_series(
             "p_set": ser.astype(float),
         }
     except Exception as exc:
-        return {"ok": False, "bus": str(record[0]), "error": str(exc)}
+        return {"ok": False, "bus": str(record.get('bus_id', 'unknown')), "error": str(exc)}
 
 
 def add_loads_from_series(
     n: pypsa.Network,
-    demand_by_bus: Dict[str, pd.Series],
-    *,
+    join: bool = True,
     extend_snapshots: bool = False,
     carrier: str = "AC",
     clip_non_negative: bool = False,
@@ -329,69 +357,77 @@ def add_loads_from_series(
     Parameters
     n: pypsa.Network
         Target network to modify.
-    demand_by_bus: Dict[str, pd.Series]
-        Mapping from bus_id to demand series (MW). The series must have a
-        DatetimeIndex. If `n.snapshots` is not set, the union of all series
-        indices is used. Otherwise, series are aligned to `n.snapshots`.
+    join: bool (default: True)
+        If True, reads 'voronoi_demand_join.gzip'; otherwise 'voronoi_demand.gzip'.
     extend_snapshots: bool (default: False)
-        If True and `n.snapshots` is already set, extend it to the union of
-        existing snapshots and all series indices; otherwise, align series to
-        the current `n.snapshots`.
+        If True and `n.snapshots` is already set, extend it to include default_timestamps;
+        otherwise, align series to the current `n.snapshots`.
     carrier: str (default: "AC")
         Carrier to assign to all added loads.
-    clip_non_negative: bool (default: True)
+    clip_non_negative: bool (default: False)
         If True, negative demand values are clipped to zero.
 
     Returns
     pypsa.Network: The modified network with new loads added.
 
+    Data Format
+    - Reads parquet file with columns: 'bus_id' (str), 'demand_series' (list of floats).
+    - Each demand_series list contains 87672 hourly values from 2015-01-01 to 2024-12-31 23:00:00 (UTC).
+    - All timestamps remain in UTC throughout processing.
+
     Approach
-    - Determine target snapshots (existing, or union of series indices).
-    - Preprocess each series in parallel (timezone drop, align, clip).
+    - Load demand data from processed parquet file.
+    - Determine target snapshots (existing, or default_timestamps, or union).
+    - Convert each demand list to pd.Series with UTC timestamps.
     - Add one Load per bus (name: "load_{bus_id}") and assign p_set.
 
     Edge cases handled
     - Missing buses are skipped with a warning.
     - Empty input returns immediately.
-    - Differing indices across series are unified via (optional) union.
     """
-    if not demand_by_bus:
-        print("No demand series provided; skipping load creation.")
-        return n
-
+    
+    repo_root = find_repo_root(Path(__file__).parent)
+    demand_dir = repo_root / 'data' / 'processed' / f"voronoi_demand{'_join' if join else ''}.gzip"
+    
+    # Read demand data (columns: bus_id, demand_series)
+    demand_df = pd.read_parquet(demand_dir, engine="pyarrow")
+    
+    # Default timestamps in UTC (87672 hourly values)
+    default_timestamps = pd.date_range(
+        start='2015-01-01', 
+        end='2024-12-31 23:00:00', 
+        freq='h',
+        tz=None  # UTC, timezone-naive
+    )
+    
+    # Determine target snapshots
     existing = getattr(n, "snapshots", pd.DatetimeIndex([]))
     if existing is None or len(existing) == 0:
-        # Use union of all series indices
-        all_idx = []
-        for ser in demand_by_bus.values():
-            idx = ser.index
-            if getattr(idx, "tz", None) is not None:
-                idx = idx.tz_localize(None)
-            all_idx.append(pd.DatetimeIndex(idx))
-        target_snapshots = pd.DatetimeIndex(sorted(pd.Index.union_many(all_idx)))
+        # No snapshots set: use default_timestamps
+        target_snapshots = default_timestamps
         n.set_snapshots(target_snapshots)
     else:
         if extend_snapshots:
-            all_idx = [pd.DatetimeIndex(existing)]
-            for ser in demand_by_bus.values():
-                idx = ser.index
-                if getattr(idx, "tz", None) is not None:
-                    idx = idx.tz_localize(None)
-                all_idx.append(pd.DatetimeIndex(idx))
+            # Extend to include both existing and default_timestamps
+            all_idx = [pd.DatetimeIndex(existing), default_timestamps]
             target_snapshots = pd.DatetimeIndex(
-                sorted(pd.Index.union_many(all_idx))
+                sorted(set(existing) | set(default_timestamps))
             )
             if not target_snapshots.equals(existing):
                 n.set_snapshots(target_snapshots)
         else:
+            # Use existing snapshots
             target_snapshots = pd.DatetimeIndex(existing)
 
-    print(f"Adding demand for {len(demand_by_bus)} buses...")
+    print(f"Adding demand for {len(demand_df)} buses...")
 
-    records = list(demand_by_bus.items())
+    # Prepare records as list of dicts
+    records = demand_df.to_dict('records')
+    
     prepare = partial(
         _prepare_load_series,
         snapshots=target_snapshots,
+        default_timestamps=default_timestamps,
         clip_non_negative=clip_non_negative,
     )
     results = _parallel_map(records, prepare)
@@ -443,23 +479,21 @@ def build_network(n: pypsa.Network, data_dict: dp.RawData, options: Dict[str, An
     This function must be adapted to mirror the logic in `main.ipynb`.
     For now, we load CSVs if paths are provided in `data_dict`.
     """
-    net = pypsa.Network()
     data_dict = data_dict.data
     
     # Example: if data_dict contains paths for core components
     buses = data_dict.get("buses")
+    
     lines = data_dict.get("lines")
     links = data_dict.get("links")
-    generators = data_dict.get("generators")
-    loads = data_dict.get("loads")
     transformers = data_dict.get("transformers", pd.DataFrame())
     converters = data_dict.get("converters", pd.DataFrame())
     
     if options is not None and options['snapshots'] is not None:
-        net.set_snapshots(options['snapshots'])
+        n.set_snapshots(options['snapshots'])
     
     if options is not None and options['name'] is not None:
-        net.name = options['name']
+        n.name = options['name']
     
     if options is not None and options['generation_carriers'] is not None:
         generation_carriers = options['generation_carriers']
@@ -636,7 +670,7 @@ def build_network(n: pypsa.Network, data_dict: dp.RawData, options: Dict[str, An
             link_error_count += 1
 
     # Additional options (CRS, snapshots, carriers) can be applied here
-    return net
+    return n
 
 def add_generators(n: pypsa.Network, RawData: dp.RawData) -> pypsa.Network:
     """Add generators from the provided DataFrame into the PyPSA network."""
@@ -692,6 +726,10 @@ def network_summary(network_obj: pypsa.Network) -> Dict[str, Any]:
         
         "snapshots": list(map(str, getattr(network_obj, "snapshots", []))),
     }
+
+def save_network(n: pypsa.Network, path: str) -> None:
+    n.export_to_netcdf(path)
+    logger.info(f"Network saved to {path}")
 
 def add_converters_transformers_to_network(n: pypsa.Network, converters_df: pd.DataFrame, transformers_df: pd.DataFrame, crs="EPSG:4326") -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """Add converters (HVDC terminals) and transformers from the provided CSVs into the PyPSA network.

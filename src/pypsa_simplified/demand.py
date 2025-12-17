@@ -47,6 +47,8 @@ v_contains = np.vectorize(lambda x, substring: substring in str(x))
 v_first_n = np.vectorize(lambda x, n: str(x)[:n])
 v_and = np.vectorize(lambda x, y: x and y)
 v_isbool = np.vectorize(lambda x,y: x==y)
+v_multiply = np.vectorize(lambda x,y: x*y)
+v_round = np.vectorize(lambda x, n: int(np.round(x, n)))
 
 def get_population_grid(path: str | Path) -> pd.DataFrame:
     """Load population grid data from Eurostat and return as DataFrame."""
@@ -316,33 +318,84 @@ def compute_demand(voronoi_path: str | Path, load_data_path: str | Path, output_
 
 def _compute_demand_country(args: tuple) -> pd.DataFrame:
     """Compute demand data for a single country."""
-    country, country_voronoi_pop, country_load_data, redistirbution = args
+    country, country_voronoi_pop, country_load_data, ifjoin = args
     
-    country_load_data = country_load_data.drop('country', axis=1)
+    if ifjoin:
+        series = country_load_data[country_load_data['Country'] == 'EU']['Load'].tolist()
+    else:
+        series = country_load_data[country_load_data['Country'] == country]['Load'].tolist()
+        
+    country_series = {}
+    
+    for idx, row in country_voronoi_pop.iterrows():
+        bus_id = row['bus_id']
+        if ifjoin:
+            # In joined case, population share is relative to EU total
+            pop_share = row['EU_population_share']
+        else:
+            # In non-joined case, population share is relative to country total
+            pop_share = row['country_population_share']
+                    
+        pop_share = float(pop_share)
+        pd_series = v_multiply(series, pop_share)
+        pd_series = v_round(pd_series, 0)
+        country_series[str(bus_id)] = pd_series
+        
+    return country_series
     
 
 
-def compute_demand(voronoi_path: str | Path, load_data_path: str | Path, output_path: str | Path):
+def compute_demand(voronoi_path: str | Path, load_data_path: str | Path) -> Path:
     """Compute demand data per Voronoi cell based on population and load data."""
     # Load Voronoi parquet with population data
     cashe_dir = geom.DEFAULT_CACHE_DIR
     voronoi_parquet_path = cashe_dir / voronoi_path.name.replace('.parquet', '_P.parquet')
     voronoi_gdf = geom.load_shapes_efficiently(voronoi_parquet_path)
     
+    voronoi_gdf['demand_series'] = None
+    voronoi_gdf.loc[voronoi_gdf['country'] == 'GB', 'country'] = 'UK'
+    
     # Detect join
     join = "_join" in voronoi_path.name
     
     # Countires in Voronoi cells
     countries = voronoi_gdf['country'].unique().tolist()
+    # Countries without 'EU' entry
+    countries = [c for c in countries if c != 'EU']
     
-    load_data_path = repo_root / "data" / "raw" / "energy_charts" / "combined_load_data.csv"
-    load_data = pd.read_csv(load_data_path, index_col=0, parse_dates=True)
+    load_data_path = repo_root / "data" / "raw" / "energy_charts" / "processed_load_data.csv"
+    load_data = pd.read_csv(load_data_path, index_col=0, parse_dates=True, dtype={'Country': str, 'Load': float, 'Missing': str})
     
-    args_list = [(country, voronoi_gdf[voronoi_gdf['country'] == country], load_data[load_data['Country'] == country]) for country in countries]
+    if join:
+        args_list = [(country, voronoi_gdf[voronoi_gdf['country'] == country], load_data[load_data['Country'] == "EU"], join) for country in countries]
+    else:
+        args_list = [(country, voronoi_gdf[voronoi_gdf['country'] == country], load_data[load_data['Country'] == country], join) for country in countries]
     
+    with mp.Pool() as pool:
+        results = pool.map(_compute_demand_country, args_list)
     
+    # Combine results into a flat bus_id -> series mapping
+    demand_out = {}
+    for country_result in results:
+        demand_out = demand_out | country_result
+        
+    if len(demand_out) == len(voronoi_gdf):
+        logger.info("Demand data computed for all Voronoi cells.")
+    else:
+        logger.warning(f"Demand data computed for {len(demand_out)} out of {len(voronoi_gdf)} Voronoi cells.")
     
+    output_dir = repo_root / 'data' / 'processed'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"voronoi_demand{'_join' if join else ''}.gzip"
+
+    logger.info(f"Saving demand data to {output_path}...")
+    # labe demnad_out as parquet
+    demand_df = pd.DataFrame({'bus_id': list(demand_out.keys()), 'demand_series': list(demand_out.values())})
+    demand_df.to_parquet(output_path, engine="pyarrow", compression="gzip", index=False)
     
+    logger.info(f"Saved demand data to {output_path}.")
+    
+    return output_path
 
 
 if __name__ == "__main__":
@@ -401,15 +454,14 @@ if __name__ == "__main__":
             
         force_demand = input("Compute demand data now? (y/N): ").strip().lower() == 'y'
         # After population exists, compute demand data and save to processed folder (skip if exists)
-        demand_out = repo_root / 'data' / 'processed' / f"demand_{voronoi_path.stem}.csv"
-        if not demand_out.exists() or force_demand:
+
+        if force_demand:
             try:
-                (voronoi_path, repo_root / 'data' / 'raw' / 'time_series_60min_singleindex_filtered.csv', demand_out)
+                logger.info("Computing demand data...")
+                demand_out = compute_demand(voronoi_path, pop_path)
                 logger.info(f"Demand data saved to {demand_out}.")
             except Exception as exc:
-                logger.warning(f"Failed to compute demand data: {exc}")
-        else:
-            logger.info(f"Demand output {demand_out} already exists. Skipping demand computation.")
+                logger.warning(f"Failed to compute demand data: {exc}")            
 
     try:
         main()
