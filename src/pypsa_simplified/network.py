@@ -321,12 +321,13 @@ def _prepare_load_series(
         bus_id = record['bus_id']
         demand_list = record['demand_series']
         
-        if not isinstance(demand_list, list):
+        # Accept both lists and numpy arrays
+        if not isinstance(demand_list, (list, np.ndarray)):
             raise TypeError(
-                f"Demand series for bus {bus_id} must be a list of floats."
+                f"Demand series for bus {bus_id} must be a list or array of numbers."
             )
         
-        # Convert list to Series with default_timestamps as index (UTC)
+        # Convert list/array to Series with default_timestamps as index (UTC)
         ser = pd.Series(demand_list, index=default_timestamps, dtype=float)
         
         # Reindex to target snapshots
@@ -456,7 +457,9 @@ def add_loads_from_series(
 
         try:
             n.add("Load", name=name, bus=bus, carrier=carrier)
-            n.loads_t.p_set[name] = res["p_set"]
+            bus_loads = np.array([l for l in res["p_set"]], dtype=float)
+            logger.info(f"{bus_loads.dtype}")
+            n.loads_t.p_set[name] = bus_loads
             added += 1
         except Exception as exc:
             errors += 1

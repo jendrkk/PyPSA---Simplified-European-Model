@@ -66,6 +66,9 @@ def weighting_for_country(df: pd.DataFrame, weights: pd.Series) -> pd.Series:
         Integer weights scaled from 1 to 100
     """
     w = normed(weights.reindex(df.index, fill_value=0))
+    if w.max() == 0:
+        # All zeros - return uniform weights
+        return pd.Series(1, index=df.index, dtype=int)
     return (w * (100 / w.max())).clip(lower=1).astype(int)
 
 
@@ -193,12 +196,14 @@ def remove_converters(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]:
 def remove_stubs(
     n: pypsa.Network,
     matching_attrs: Iterable[str] | None = None,
+    aggregation_strategies: dict | None = None,
 ) -> tuple[pypsa.Network, pd.Series]:
     """
     Remove stub buses (dead-ends) from the network iteratively.
     
-    A stub is a bus with only one connection. These are removed sequentially
-    until no more stubs exist.
+    This function uses PyPSA's clustering mechanism to properly aggregate stubs
+    to their neighbors, ensuring all one-port components (loads, generators, etc.)
+    are correctly remapped to remaining buses.
     
     Parameters
     ----------
@@ -207,33 +212,45 @@ def remove_stubs(
     matching_attrs : Iterable[str], optional
         Bus attributes that must match for aggregation (e.g., ['country'])
         If None or empty, stubs are removed across borders
+    aggregation_strategies : dict, optional
+        Custom aggregation strategies for clustering
         
     Returns
     -------
     tuple[pypsa.Network, pd.Series]
         Cleaned network and busmap showing aggregations
+        
+    Notes
+    -----
+    Uses PyPSA's get_clustering_from_busmap() to ensure all network components
+    (including loads, generators, etc.) are properly remapped when buses are
+    aggregated.
     """
     logger.info("Removing stub buses from network")
     
     if matching_attrs is None:
         matching_attrs = []
     
+    if aggregation_strategies is None:
+        aggregation_strategies = {}
+    
+    # Get busmap from PyPSA's stub removal algorithm
     busmap = busmap_by_stubs(n, matching_attrs=matching_attrs)
     
-    # Remove clustered buses and branches
-    buses_to_del = n.buses.index.difference(busmap)
-    n.remove("Bus", buses_to_del)
+    # Count how many buses will be removed
+    buses_to_agg = len(busmap) - len(busmap.unique())
     
-    for c in n.branch_components:
-        df = n.df(c)
-        bus_cols = [col for col in df.columns if col.startswith("bus")]
-        mask = df[bus_cols].isin(busmap).all(axis=1)
-        to_remove = df[~mask].index
-        if len(to_remove) > 0:
-            n.remove(c, to_remove)
+    # Use PyPSA's clustering mechanism to properly aggregate all components
+    # This automatically handles loads, generators, and all other one-port components
+    clustering = get_clustering_from_busmap(
+        n,
+        busmap,
+        bus_strategies=aggregation_strategies.get("buses", {}),
+        line_strategies=aggregation_strategies.get("lines", {}),
+    )
     
-    logger.info(f"Removed {len(buses_to_del)} stub buses")
-    return n, busmap
+    logger.info(f"Removed {buses_to_agg} stub buses")
+    return clustering.n, busmap
 
 
 def aggregate_to_substations(
