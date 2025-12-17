@@ -161,12 +161,21 @@ def calculate_population_voronoi(pop_path: str | Path, voronoi_path: str | Path,
             voronoi_csv = pd.DataFrame({
                 'bus_id': voronoi_gdf.get('bus_id', pd.Series(range(len(voronoi_gdf))))
             })
+        voronoi_csv['country'] = voronoi_gdf['country']
         voronoi_csv['population'] = voronoi_gdf['population']
         voronoi_csv['EU_population_share'] = voronoi_gdf['EU_population_share']
         voronoi_csv.to_csv(voronoi_csv_path, index=False)
         logger.info(f"Saved Voronoi population data to {voronoi_csv_path}.")
     except Exception as exc:
         logger.warning(f"Failed to write voronoi CSV cache ({exc}); returning computed DataFrame anyway.")
+    
+    # We save also the geodataframe as parquet for future use
+    voronoi_parquet_path = cashe_dir / voronoi_path.name.replace('.parquet', '_P.parquet')
+    try:
+        geom.save_shapes_efficiently(voronoi_gdf, voronoi_parquet_path)
+        logger.info(f"Saved Voronoi GeoDataFrame with population to {voronoi_parquet_path}.")
+    except Exception as exc:
+        logger.warning(f"Failed to write voronoi parquet cache ({exc}); continuing.")
     
     # Save also population variable as separate file with bus index and population only
     pop_name = voronoi_path.name.replace('.parquet', '_population.csv')

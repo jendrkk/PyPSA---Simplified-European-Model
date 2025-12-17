@@ -48,6 +48,7 @@ data/other/
 data/cache/geometry/
 PyPSA/
 pypsa_EUR/
+results/
 
 # Keep a small sample file in repo if present
 !data/sample.csv

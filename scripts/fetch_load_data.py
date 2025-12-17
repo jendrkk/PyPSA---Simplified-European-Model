@@ -70,12 +70,13 @@ def json_to_dataframe(json_data: dict) -> pd.DataFrame:
     df = pd.DataFrame(index=timestamps)
     df.index = df.index.tz_localize("UTC")
     df.index = df.index + pd.Timedelta(hours=1)
-
+    df['Timestamp'] = df.index
+    
     for prod_type in json_data.get("production_types", []):
         name = prod_type.get("name")
         data = prod_type.get("data")
         df[name] = data
-
+        
     return df
 
 def download_data(link: str, outpath: Union[Path, str]) -> None:
@@ -167,9 +168,10 @@ def main():
     i = 0
     for country, link in links:
         if check_dir_for_data(link, default_outpath) and not force_donwload:
-            print(f"Data for {country} already exists. Skipping download.")
+            year = link.split("start=")[1].split("-")[0]
+            #print(f"Data for {country} and {year} already exists. Skipping download.")
             i += 1
-            continue:
+            continue
         try:
             download_data(link, default_outpath)
         except Exception as exc:  # keep going if one file fails
@@ -182,6 +184,7 @@ def main():
     
     combine_files = input("Combine all yearly files into single country files? (y/n): ").strip().lower() == 'y'
     if combine_files:
+        print(default_outpath)
         combine_all(countries, years, default_outpath)
         print("Combined files have been created.")
 if __name__ == "__main__":
