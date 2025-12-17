@@ -1,16 +1,3 @@
-"""Weather processing utilities.
-
-This module provides a small function to load, filter and combine
-wind-speed and solar radiation CSV files and save the processed
-DataFrame to ``data/processed``.
-
-Usage (CLI):
-  python scripts/weather.py --ws PATH_TO_WS_CSV --rad PATH_TO_RAD_CSV
-
-The original quick script read CSVs with `skiprows=52`; this module
-keeps that behaviour but exposes the paths and date-range as arguments.
-"""
-
 from pathlib import Path
 import argparse
 import logging
@@ -31,82 +18,97 @@ def find_repo_root(start_path: Path, max_up: int = 6) -> Path:
     return start_path.resolve()
 
 def process_weather(rad_path: Union[str, Path], ws_path: Union[str, Path],
-					start: str = "2015-01-01", end: str = "2024-12-31",
-					skiprows: int = 52) -> pd.DataFrame:
-	"""Load, filter and combine radiation and wind-speed CSV files.
+                    start: str = "2015-01-01", end: str = "2024-12-31",
+                    skiprows: int = 52) -> pd.DataFrame:
+    """Load, filter and combine radiation and wind-speed CSV files."""
+    # 确保路径为 Path 对象
+    rad_path, ws_path = Path(rad_path), Path(ws_path)
+    
+    if not rad_path.exists() or not ws_path.exists():
+        raise FileNotFoundError(f"Input files not found: {rad_path} or {ws_path}")
 
-	Parameters
-	- rad_path, ws_path: paths to CSV files (they must contain a `Date` column)
-	- start, end: inclusive date range (YYYY-MM-DD)
-	- skiprows: int passed to ``pd.read_csv`` (keeps original behaviour)
+    rad = pd.read_csv(rad_path, skiprows=skiprows)
+    ws = pd.read_csv(ws_path, skiprows=skiprows)
 
-	Returns
-	- Combined DataFrame indexed by datetime `Date` with prefixed columns.
-	"""
-	rad = pd.read_csv(rad_path, skiprows=skiprows)
-	ws = pd.read_csv(ws_path, skiprows=skiprows)
+    if 'Date' not in rad.columns or 'Date' not in ws.columns:
+        raise ValueError("Input CSV files must contain a 'Date' column")
 
-	if 'Date' not in rad.columns or 'Date' not in ws.columns:
-		raise ValueError("Input CSV files must contain a 'Date' column")
+    rad['Date'] = pd.to_datetime(rad['Date'])
+    ws['Date'] = pd.to_datetime(ws['Date'])
 
-	rad = rad.copy()
-	ws = ws.copy()
-	rad['Date'] = pd.to_datetime(rad['Date'])
-	ws['Date'] = pd.to_datetime(ws['Date'])
+    # 过滤时间段
+    rad_filtered = rad[(rad['Date'] >= start) & (rad['Date'] <= end)].copy()
+    ws_filtered = ws[(ws['Date'] >= start) & (ws['Date'] <= end)].copy()
 
-	rad_filtered = rad[(rad['Date'] >= start) & (rad['Date'] <= end)].copy()
-	ws_filtered = ws[(ws['Date'] >= start) & (ws['Date'] <= end)].copy()
+    # 去重并设置索引
+    rad_filtered = rad_filtered.drop_duplicates(subset='Date').set_index('Date')
+    ws_filtered = ws_filtered.drop_duplicates(subset='Date').set_index('Date')
 
-	rad_filtered = rad_filtered[~rad_filtered.index.duplicated(keep='first')]
-	ws_filtered = ws_filtered[~ws_filtered.index.duplicated(keep='first')]
+    # 重命名列名以区分风速和辐射
+    ws_filtered.columns = [f"ws_{col}" for col in ws_filtered.columns]
+    rad_filtered.columns = [f"rad_{col}" for col in rad_filtered.columns]
 
-	ws_filtered.set_index('Date', inplace=True)
-	rad_filtered.set_index('Date', inplace=True)
+    df_w = pd.concat([ws_filtered, rad_filtered], axis=1)
+    logger.debug("Processed weather DataFrame shape: %s", df_w.shape)
+    return df_w
 
-	ws_filtered.columns = [f"ws_{col}" for col in ws_filtered.columns]
-	rad_filtered.columns = [f"rad_{col}" for col in rad_filtered.columns]
-
-	df_w = pd.concat([ws_filtered, rad_filtered], axis=1)
-	logger.debug("Processed weather DataFrame shape: %s", df_w.shape)
-	return df_w
-
-
-def save_processed(df: pd.DataFrame, out_dir: Union[str, Path] = "data/processed",
-				   filename: str = "weather_processed.csv.gz") -> Path:
-	"""Save the processed DataFrame to `out_dir/filename`.
-
-	The file is written as a gzipped CSV to avoid additional runtime
-	dependencies.
-	"""
-	out_path = Path(out_dir)
-	out_path.mkdir(parents=True, exist_ok=True)
-	full = out_path / filename
-	df.to_csv(full, compression='gzip', index=True)
-	logger.info("Saved processed weather to %s", full)
-	return full
-
+def save_processed(df: pd.DataFrame, out_dir: Union[str, Path],
+                   filename: str = "weather_processed.csv.gz") -> Path:
+    """Save the processed DataFrame to out_dir/filename."""
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    full_path = out_path / filename
+    df.to_csv(full_path, compression='gzip', index=True)
+    logger.info("Saved processed weather to %s", full_path)
+    return full_path
 
 def _cli():
+    # 在函数内动态获取根目录，避免全局作用域报错
+    repo_root = find_repo_root(Path(__file__).parent)
+    default_raw_dir = repo_root / "data" / "raw" / "weather"
+    default_out_dir = repo_root / "data" / "processed"
+
+    p = argparse.ArgumentParser(description="Process weather CSVs and save result")
     
-	p = argparse.ArgumentParser(description="Process weather CSVs and save result")
-	p.add_argument("--rad", required=False, help="Path to radiation CSV")
-	p.add_argument("--ws", required=False, help="Path to wind-speed CSV")
-	p.add_argument("--start", default="2015-01-01", help="Start date (inclusive)")
-	p.add_argument("--end", default="2024-12-31", help="End date (inclusive)")
-	p.add_argument("--out-dir", default=REPO_ROOT / "data" / "processed" , help="Output directory")
-	p.add_argument("--out-file", default="weather_processed.csv.gz", help="Output filename")
-	p.add_argument("--skiprows", type=int, default=52, help="Rows to skip when reading CSVs")
-	p.add_argument("--verbose", action="store_true", help="Enable debug logging")
-	args = p.parse_args()
+    # 将动态路径设为默认值，同时允许用户通过命令行覆盖
+    p.add_argument("--rad", default=default_raw_dir / "solar.csv", help="Path to radiation CSV")
+    p.add_argument("--ws", default=default_raw_dir / "wind.csv", help="Path to wind-speed CSV")
+    p.add_argument("--start", default="2015-01-01", help="Start date (inclusive)")
+    p.add_argument("--end", default="2024-12-31", help="End date (inclusive)")
+    p.add_argument("--out-dir", default=default_out_dir, help="Output directory")
+    p.add_argument("--out-file", default="weather_processed.csv.gz", help="Output filename")
+    p.add_argument("--skiprows", type=int, default=52, help="Rows to skip when reading CSVs")
+    p.add_argument("--verbose", action="store_true", help="Enable debug logging")
     
-	logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-						format="%(asctime)s %(levelname)s %(message)s")
+    args = p.parse_args()
     
-	df = process_weather(Path(REPO_ROOT / "solar.csv"), Path(REPO_ROOT / 'wind.csv'), start=args.start, end=args.end, skiprows=args.skiprows)
-	out = save_processed(df, out_dir=args.out_dir, filename=args.out_file)
-	print(out)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
     
+    # 使用解析后的参数 args，不再使用硬编码字符串
+    try:
+        df = process_weather(
+            rad_path=args.rad, 
+            ws_path=args.ws, 
+            start=args.start, 
+            end=args.end, 
+            skiprows=args.skiprows
+        )
+        out = save_processed(df, out_dir=args.out_dir, filename=args.out_file)
+        print(f"Success! Processed data saved to: {out}")
+    except Exception as e:
+        logger.error("Failed to process weather data: %s", e)
 
 if __name__ == "__main__":
-    REPO_ROOT = find_repo_root(Path(__file__).parent) / "data" / "raw" / "weather"
     _cli()
+
+# You need to make sure this the folder structure 
+# Git/
+# ├── .git (或 README.md)
+# ├── data/
+# │   └── raw/
+# │       └── weather/
+# │           ├── solar.csv
+# │           └── wind.csv
+# └── scripts/
+    # └── weather_test.py
