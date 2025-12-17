@@ -76,7 +76,7 @@ EU27 = [
     'AT', 'BE', 'BG', 'HR', 'CZ', 'DK', 'EE', 'EL', 'FI', 'FR',
     'DE', 'GR', 'HU', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT', 'NL',
     'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE'
-]
+] + ['UK', 'CH', 'NO', 'GB']  # include UK, CH, NO for practical purposes
 
 EUROPE_EXTREME_POINTS = Polygon([(-12,72),(40.3,72),(40.3,34),(-12,34)])
 
@@ -1135,7 +1135,7 @@ def get_voronoi(
         country_shapes = download_country_shapes(countries, cache_dir)
         combined = join_shapes(country_shapes)
         try:
-            mask = buses_df.apply(
+            mask = buses_df.apply(  
             lambda row: point_in_shape(point = to_point(row['geometry']), shape = combined),
             axis=1
             )

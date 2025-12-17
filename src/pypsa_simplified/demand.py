@@ -41,6 +41,12 @@ src_path = repo_root / 'src'
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger(__name__)
 
+# Useful fast functions
+v_startswith = np.vectorize(lambda x, prefix: str(x).startswith(prefix))
+v_contains = np.vectorize(lambda x, substring: substring in str(x))
+v_first_n = np.vectorize(lambda x, n: str(x)[:n])
+v_and = np.vectorize(lambda x, y: x and y)
+v_isbool = np.vectorize(lambda x,y: x==y)
 
 def get_population_grid(path: str | Path) -> pd.DataFrame:
     """Load population grid data from Eurostat and return as DataFrame."""
@@ -50,30 +56,6 @@ def get_population_grid(path: str | Path) -> pd.DataFrame:
     logger.info(f"Loaded population grid with {len(pop_grid)} entries.")
     
     return pop_grid
-
-def _compute_optimal_buffer(voronoi_row: pd.Series) -> float:
-    """Compute optimal buffer distance for a single coordinate."""
-    lat = voronoi_row['bus_y']
-    lon = voronoi_row['bus_x']
-    pt = Point(lon, lat)
-    
-    run = 0
-    if pt.within(voronoi_row.geometry):
-        area = voronoi_row['area_km2']
-        increment = 0.001 * area
-        buffer = 0.0
-        run = 0
-        while shapely.within(voronoi_row.geometry, pt.buffer(buffer)):
-            buffer += increment
-            run += 1
-            if run == 1000:
-                logger.warning(f"Max iterations reached for buffer calculation at point ({lon}, {lat}).")
-                increment *= 2  
-        
-        return buffer
-    else:
-        logger.warning(f"Point ({lon}, {lat}) is not within its Voronoi cell.")
-        return 0.0
     
 def _sqares_in_rect(args: tuple) -> pd.DataFrame:
     """Get population data points within the rectangle."""
@@ -126,42 +108,186 @@ def calculate_population_voronoi(pop_path: str | Path, voronoi_path: str | Path,
     logger.info(f"Loaded {len(voronoi_gdf)} Voronoi cells.")
     # Initialize population column
     voronoi_gdf['population'] = 0  # Initialize population column
+    voronoi_gdf['EU_population_share'] = 0.0  # Initialize population share column
+
+    # If cached CSV exists and already contains population information, skip heavy computation
+    cashe_dir = geom.DEFAULT_CACHE_DIR
+    voronoi_csv_path = cashe_dir / voronoi_path.name.replace('.parquet', '.csv')
+    if voronoi_csv_path.exists():
+        try:
+            existing = pd.read_csv(voronoi_csv_path)
+            if 'population' in existing.columns and 'EU_population_share' in existing.columns:
+                logger.info(f"Found existing population CSV at {voronoi_csv_path}; skipping computation.")
+                return existing
+        except Exception:
+            logger.info("Existing Voronoi CSV found but failed to read; will recompute.")
     # Population per Voronoi cell via point_in_shape method from geom that takes lon, lat and shape
     logger.info("Calculating population per Voronoi cell...")
     check_args = [(idx, row, pop_grid) for idx, row in voronoi_gdf.iterrows()]
-    with mp.Pool() as pool:
-        pop_datas = pool.map(_sqares_in_rect, check_args)
-        logger.info(f"Using {psutil.cpu_count(logical=False)} CPU cores for parallel processing.")
-        logger.info(f"Memory usage: {psutil.virtual_memory().percent}%")
-        logger.info(f"CPU usage: {psutil.cpu_percent(interval=1)}%")
+
+    # Helper to run mapping in pool with fallback to sequential mapping
+    def _map_with_fallback(func, args_list):
+        try:
+            with mp.Pool() as pool:
+                result = pool.map(func, args_list)
+            logger.info(f"Parallel map completed using {psutil.cpu_count(logical=False)} physical cores.")
+            logger.info(f"Memory usage: {psutil.virtual_memory().percent}%")
+            logger.info(f"CPU usage: {psutil.cpu_percent(interval=1)}%")
+            return result
+        except Exception as exc:
+            logger.warning(f"Parallel processing failed ({exc}); falling back to sequential loop.")
+            results = []
+            for a in args_list:
+                results.append(func(a))
+            return results
+
+    pop_datas = _map_with_fallback(_sqares_in_rect, check_args)
     
     logger.info("Summing population within each Voronoi cell...")
     check_args = [(idx, voronoi_gdf.iloc[idx], pop_datas[idx]) for idx in range(len(voronoi_gdf))]
-    with mp.Pool() as pool:
-        populations = pool.map(_sum_population_in_shape, check_args)
-        logger.info(f"Using {psutil.cpu_count(logical=False)} CPU cores for parallel processing.")
-        logger.info(f"Memory usage: {psutil.virtual_memory().percent}%")
-        logger.info(f"CPU usage: {psutil.cpu_percent(interval=1)}%")
+    populations = _map_with_fallback(_sum_population_in_shape, check_args)
     
     logger.info("Population calculation completed.")
-    voronoi_gdf['population'] = populations
     
-    cashe_dir = geom.DEFAULT_CACHE_DIR
-    voronoi_csv_path = cashe_dir / voronoi_path.name.replace('.parquet', '.csv')
-    voronoi_csv = pd.read_csv(voronoi_csv_path)
-    voronoi_csv['population'] = voronoi_gdf['population']
-    voronoi_csv.to_csv(voronoi_csv_path, index=False)
-    logger.info(f"Saved Voronoi population data to {voronoi_csv_path}.")
+    voronoi_gdf['population'] = populations
+    voronoi_gdf['EU_population_share'] = voronoi_gdf['population'] / voronoi_gdf['population'].sum()
+
+    # Update or create CSV cache with population values
+    try:
+        if voronoi_csv_path.exists():
+            voronoi_csv = pd.read_csv(voronoi_csv_path)
+        else:
+            # Create a minimal CSV structure from GeoDataFrame if not present
+            voronoi_csv = pd.DataFrame({
+                'bus_id': voronoi_gdf.get('bus_id', pd.Series(range(len(voronoi_gdf))))
+            })
+        voronoi_csv['population'] = voronoi_gdf['population']
+        voronoi_csv['EU_population_share'] = voronoi_gdf['EU_population_share']
+        voronoi_csv.to_csv(voronoi_csv_path, index=False)
+        logger.info(f"Saved Voronoi population data to {voronoi_csv_path}.")
+    except Exception as exc:
+        logger.warning(f"Failed to write voronoi CSV cache ({exc}); returning computed DataFrame anyway.")
     
     # Save also population variable as separate file with bus index and population only
     pop_name = voronoi_path.name.replace('.parquet', '_population.csv')
     pop_path = cashe_dir / pop_name
-    pop_df = voronoi_csv[['bus_id', 'population']]
-    pop_df.to_csv(pop_path, index=False)
-    logger.info(f"Saved population data to {pop_path}.")
-    
-    # Return the whole GeoDataFrame with population column
+    try:
+        pop_df = voronoi_csv[['bus_id', 'population', 'EU_population_share']]
+        pop_df.to_csv(pop_path, index=False)
+        logger.info(f"Saved population data to {pop_path}.")
+    except Exception:
+        logger.warning("Could not write population-only CSV; continuing.")
+
+    # Return the cached/updated CSV DataFrame (keeps original function behavior)
     return voronoi_csv
+
+def execute_CPV(pop_path: str | Path, voronoi_path: str | Path, options: Dict = None):
+    """Execute the calculation of population per Voronoi cell."""
+    import datetime as dt
+
+    answer = input('Show live system monitoring during run? (y/N): ').strip().lower()
+    enable_monitor = answer.startswith('y')
+
+    stop_event = threading.Event()
+    monitor_thread = None
+    if enable_monitor:
+        monitor_thread = threading.Thread(target=monitor_system, args=(stop_event, 10), daemon=True)
+        monitor_thread.start()
+
+    start_time = dt.datetime.now()
+    try:
+        calculate_population_voronoi(pop_path, voronoi_path)
+    finally:
+        # Ensure we stop the monitor thread if it was started
+        if enable_monitor:
+            stop_event.set()
+            # Give monitor a moment to exit
+            monitor_thread.join(timeout=5)
+        end_time = dt.datetime.now()
+        logger.info(f"Total computation time: {end_time - start_time}")
+
+def load_load_data(path: str | Path) -> pd.DataFrame:
+    """Load load data from CSV file."""
+    logger.info(f"Loading load data from {path}...")
+    load_data_path = repo_root / "data" / "raw" / "time_series_60min_singleindex_filtered.csv"
+
+    # Load the load data
+    load_data = pd.read_csv(load_data_path, index_col=0, parse_dates=True)
+    # Column 'utc_timestamp' to datetime index and in GMT+1
+    load_data.index = pd.to_datetime(load_data.index).tz_convert(60*60)
+    
+    logger.info(f"Loaded load data with shape {load_data.shape}.")
+    return load_data
+
+def filter_load_data(load_data: pd.DataFrame, countries: list[str]) -> pd.DataFrame:
+    """Filter load data for specified countries."""
+    logger.info(f"Filtering load data for countries...")
+    cols = np.array(load_data.columns.tolist())
+    country_tags = v_first_n(cols, 2)
+    country_tags = country_tags[country_tags != 'GB']
+    country_tags = np.unique(country_tags)
+
+    load_cols = [f"{country}_load_actual_entsoe_transparency" if country in countries else "not included" for country in country_tags]
+
+    mask = np.where(v_isbool(v_startswith(load_cols, "not").tolist(), False).tolist())[0].tolist()
+    new_load_cols = []
+    for i in mask:
+        new_load_cols.append(load_cols[i])
+
+    new_load_cols
+
+    cols = cols[v_startswith(cols, "GB")]
+    cols = cols[v_contains(cols, "_load_actual")]
+
+    new_load_cols = new_load_cols + cols.tolist()
+    
+    if len(new_load_cols) == 30:
+        logger.info("All country load data included.")
+    else:
+        logger.info(f"Included load data for {len(new_load_cols)} countries.")
+
+    filtered_load_data = load_data.copy()
+    filtered_load_data = filtered_load_data[new_load_cols]
+    filtered_load_data.columns = v_first_n(filtered_load_data.columns,2)
+    
+    return filtered_load_data
+
+def save_load_data(load_data: pd.DataFrame, path: str | Path):
+    """Save filtered load data to CSV file."""
+    logger.info(f"Saving filtered load data to {path}...")
+    load_data.to_csv(path)
+    logger.info("Load data saved.")
+    
+def compute_demand(voronoi_path: str | Path, load_data_path: str | Path, output_path: str | Path, join: bool = False):
+    """Compute demand data per Voronoi cell based on population and load data."""
+    # Load Voronoi population data
+    cashe_dir = geom.DEFAULT_CACHE_DIR
+    voronoi_csv_path = cashe_dir / voronoi_path.name.replace('.parquet', '.csv')
+    voronoi_pop = pd.read_csv(voronoi_csv_path)
+    
+    # Load load data
+    load_data = load_load_data(load_data_path)
+    
+    # Filter load data for countries in Voronoi cells
+    filtered_load_data = filter_load_data(load_data, geom.EU27)
+    
+    # Compute demand per Voronoi cell
+    demand_data = pd.DataFrame(index=filtered_load_data.index)
+    for idx, row in voronoi_pop.iterrows():
+        
+        country = row['country']
+        bus_id = row['bus_id']
+        pop_share = row['EU_population_share']
+        
+        load_col = f"{country}_load_actual_entsoe_transparency"
+        if load_col in filtered_load_data.columns:
+            demand_data[bus_id] = filtered_load_data[load_col] * pop_share
+        else:
+            logger.warning(f"Load data for country {country} not found. Skipping bus {bus_id}.")
+    
+    # Save demand data
+    save_load_data(demand_data, output_path)
+    
 
 if __name__ == "__main__":
     def monitor_system(stop_event: threading.Event, interval: int = 10) -> None:
@@ -196,30 +322,32 @@ if __name__ == "__main__":
 
 
     def main():
+        # Ask if we want a joined version or not
+        join = input('Compute population data for joined Voronoi cells? (T/F): ').strip().lower()
         pop_path = repo_root / 'data' / 'processed' / 'jrc_population_nonzero.parquet'
-        voronoi_path = geom.DEFAULT_CACHE_DIR / 'voronoi_eu27_join.parquet'
-        import datetime as dt
+        voronoi_path = geom.DEFAULT_CACHE_DIR / Path(f"voronoi_eu27{'_join' if join == 't' else ''}.parquet")
 
-        answer = input('Show live system monitoring during run? (y/N): ').strip().lower()
-        enable_monitor = answer.startswith('y')
+        # Ensure voronoi_path is a Path
+        voronoi_path = Path(voronoi_path)
 
-        stop_event = threading.Event()
-        monitor_thread = None
-        if enable_monitor:
-            monitor_thread = threading.Thread(target=monitor_system, args=(stop_event, 10), daemon=True)
-            monitor_thread.start()
+        # If the voronoi population CSV does not exist in cache, create it first
+        cashe_dir = geom.DEFAULT_CACHE_DIR
+        pop_csv = cashe_dir / voronoi_path.name.replace('.parquet', '_population.csv')
+        if not pop_csv.exists():
+            execute_CPV(pop_path, voronoi_path)
+        else:
+            logger.info(f"Population data for {voronoi_path} already exists at {pop_csv}. Skipping computation.")
 
-        start_time = dt.datetime.now()
-        try:
-            calculate_population_voronoi(pop_path, voronoi_path)
-        finally:
-            # Ensure we stop the monitor thread if it was started
-            if enable_monitor:
-                stop_event.set()
-                # Give monitor a moment to exit
-                monitor_thread.join(timeout=5)
-            end_time = dt.datetime.now()
-            logger.info(f"Total computation time: {end_time - start_time}")
+        # After population exists, compute demand data and save to processed folder (skip if exists)
+        demand_out = repo_root / 'data' / 'processed' / f"demand_{voronoi_path.stem}.csv"
+        if not demand_out.exists():
+            try:
+                compute_demand(voronoi_path, repo_root / 'data' / 'raw' / 'time_series_60min_singleindex_filtered.csv', demand_out)
+                logger.info(f"Demand data saved to {demand_out}.")
+            except Exception as exc:
+                logger.warning(f"Failed to compute demand data: {exc}")
+        else:
+            logger.info(f"Demand output {demand_out} already exists. Skipping demand computation.")
 
     try:
         main()

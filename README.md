@@ -250,6 +250,19 @@ This repository utilizes the PyPSA package and its documentation as a primary re
 - PyPSA Documentation: [https://pypsa.readthedocs.io/](https://pypsa.readthedocs.io/)
 - pypsa-eur Repository: [https://github.com/PyPSA/pypsa-eur](https://github.com/PyPSA/pypsa-eur)
 
+## Recent changes
+
+- `scripts/download_load_data.py`: added robust downloading of per-country, per-year
+	timeseries from the energy-charts API. Improvements include:
+	- automatic creation of output directory `data/raw/energy_charts`;
+	- safer HTTP handling with `requests.raise_for_status()`;
+	- parsing of the API JSON shape into a tidy `pandas.DataFrame`;
+	- per-country-per-year filenames to avoid overwriting; and
+	- resilient loop behavior: failures for a single file are logged and the
+		downloader proceeds to the next file (so partial runs complete).
+
+These changes formalize and document the recent scripting improvements.
+
 ## Getting Started
 
 ### Prerequisites

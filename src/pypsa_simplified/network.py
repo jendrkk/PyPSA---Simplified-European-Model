@@ -268,6 +268,174 @@ T_CARRIERS = {
     },
 }
 
+
+def _prepare_load_series(
+    record: tuple[str, pd.Series],
+    snapshots: pd.DatetimeIndex,
+    clip_non_negative: bool = False,
+) -> dict:
+    """Prepare a single load time series for insertion.
+
+    Parameters
+    record: (bus_id, series)
+        Tuple with the bus identifier and its demand series.
+    snapshots: pd.DatetimeIndex
+        Target snapshots to align the series to.
+    clip_non_negative: bool
+        If True, negative values are clipped to zero.
+
+    Returns
+    dict: Mapping with fields: ok, bus, name, p_set (pd.Series) or error.
+
+    Notes
+    - Timezone-aware indices are converted to timezone-naive.
+    - Series are reindexed to `snapshots`, filling missing with 0.
+    """
+    try:
+        bus_id, ser = record
+        if not isinstance(ser.index, pd.DatetimeIndex):
+            raise TypeError(
+                f"Demand series for bus {bus_id} must have DatetimeIndex."
+            )
+
+        if ser.index.tz is not None:
+            ser.index = ser.index.tz_localize(None)
+
+        ser = ser.sort_index()
+        ser = ser.reindex(snapshots, fill_value=0.0)
+        if clip_non_negative:
+            ser = ser.clip(lower=0.0)
+
+        return {
+            "ok": True,
+            "bus": str(bus_id),
+            "name": f"load_{bus_id}",
+            "p_set": ser.astype(float),
+        }
+    except Exception as exc:
+        return {"ok": False, "bus": str(record[0]), "error": str(exc)}
+
+
+def add_loads_from_series(
+    n: pypsa.Network,
+    demand_by_bus: Dict[str, pd.Series],
+    *,
+    extend_snapshots: bool = False,
+    carrier: str = "AC",
+    clip_non_negative: bool = False,
+) -> pypsa.Network:
+    """Add per-bus demand time series as Loads into the network.
+
+    Parameters
+    n: pypsa.Network
+        Target network to modify.
+    demand_by_bus: Dict[str, pd.Series]
+        Mapping from bus_id to demand series (MW). The series must have a
+        DatetimeIndex. If `n.snapshots` is not set, the union of all series
+        indices is used. Otherwise, series are aligned to `n.snapshots`.
+    extend_snapshots: bool (default: False)
+        If True and `n.snapshots` is already set, extend it to the union of
+        existing snapshots and all series indices; otherwise, align series to
+        the current `n.snapshots`.
+    carrier: str (default: "AC")
+        Carrier to assign to all added loads.
+    clip_non_negative: bool (default: True)
+        If True, negative demand values are clipped to zero.
+
+    Returns
+    pypsa.Network: The modified network with new loads added.
+
+    Approach
+    - Determine target snapshots (existing, or union of series indices).
+    - Preprocess each series in parallel (timezone drop, align, clip).
+    - Add one Load per bus (name: "load_{bus_id}") and assign p_set.
+
+    Edge cases handled
+    - Missing buses are skipped with a warning.
+    - Empty input returns immediately.
+    - Differing indices across series are unified via (optional) union.
+    """
+    if not demand_by_bus:
+        print("No demand series provided; skipping load creation.")
+        return n
+
+    existing = getattr(n, "snapshots", pd.DatetimeIndex([]))
+    if existing is None or len(existing) == 0:
+        # Use union of all series indices
+        all_idx = []
+        for ser in demand_by_bus.values():
+            idx = ser.index
+            if getattr(idx, "tz", None) is not None:
+                idx = idx.tz_localize(None)
+            all_idx.append(pd.DatetimeIndex(idx))
+        target_snapshots = pd.DatetimeIndex(sorted(pd.Index.union_many(all_idx)))
+        n.set_snapshots(target_snapshots)
+    else:
+        if extend_snapshots:
+            all_idx = [pd.DatetimeIndex(existing)]
+            for ser in demand_by_bus.values():
+                idx = ser.index
+                if getattr(idx, "tz", None) is not None:
+                    idx = idx.tz_localize(None)
+                all_idx.append(pd.DatetimeIndex(idx))
+            target_snapshots = pd.DatetimeIndex(
+                sorted(pd.Index.union_many(all_idx))
+            )
+            if not target_snapshots.equals(existing):
+                n.set_snapshots(target_snapshots)
+        else:
+            target_snapshots = pd.DatetimeIndex(existing)
+
+    print(f"Adding demand for {len(demand_by_bus)} buses...")
+
+    records = list(demand_by_bus.items())
+    prepare = partial(
+        _prepare_load_series,
+        snapshots=target_snapshots,
+        clip_non_negative=clip_non_negative,
+    )
+    results = _parallel_map(records, prepare)
+
+    missing_bus = 0
+    errors = 0
+    added = 0
+    existing_buses = set(n.buses.index.astype(str))
+
+    for res in results:
+        if not res.get("ok", False):
+            errors += 1
+            if errors <= 5:
+                print(
+                    f"Load prep failed for bus {res.get('bus')}: {res.get('error')}"
+                )
+            continue
+
+        bus = res["bus"]
+        name = res["name"]
+        if bus not in existing_buses:
+            missing_bus += 1
+            if missing_bus <= 5:
+                print(f"Bus {bus} not in network; skipping load {name}.")
+            continue
+
+        try:
+            n.add("Load", name=name, bus=bus, carrier=carrier)
+            n.loads_t.p_set[name] = res["p_set"]
+            added += 1
+        except Exception as exc:
+            errors += 1
+            if errors <= 5:
+                print(f"Failed adding load {name} on {bus}: {exc}")
+
+    if missing_bus:
+        print(f"Skipped {missing_bus} loads due to missing buses.")
+    if errors:
+        print(f"Encountered {errors} errors while preparing/adding loads.")
+    print(f"Added {added} loads with time series.")
+
+    return n
+
+
 def build_network(n: pypsa.Network, data_dict: dp.RawData, options: Dict[str, Any] | None = None) -> pypsa.Network:
     """
     Build a `pypsa.Network` from a lightweight source dictionary.
