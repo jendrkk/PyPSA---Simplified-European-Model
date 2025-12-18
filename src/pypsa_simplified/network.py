@@ -694,6 +694,477 @@ def add_generators(n: pypsa.Network, RawData: dp.RawData) -> pypsa.Network:
     return n
 
 
+# =============================================================================
+# RENEWABLE GENERATOR FUNCTIONS (with time-varying profiles)
+# =============================================================================
+
+# Fuel type to carrier mapping (align powerplants.csv with PyPSA carriers)
+FUEL_TO_CARRIER = {
+    'Wind': 'wind',
+    'Solar': 'solar',
+    'Hydro': 'hydro',
+    'Natural Gas': 'gas',
+    'Hard Coal': 'hard coal',
+    'Lignite': 'lignite',
+    'Nuclear': 'nuclear',
+    'Oil': 'oil',
+    'Bioenergy': 'biomass',
+    'Waste': 'waste',
+    'Geothermal': 'geothermal',
+    'Other': 'other',
+}
+
+# Default marginal costs (€/MWh) based on fuel type
+# Can be refined with actual fuel prices
+DEFAULT_MARGINAL_COSTS = {
+    'wind': 0.0,        # No fuel cost for renewables
+    'solar': 0.0,
+    'hydro': 0.0,
+    'gas': 50.0,        # Natural gas CCGT (fuel + variable O&M)
+    'hard coal': 35.0,  # Hard coal (fuel + variable O&M)
+    'lignite': 25.0,    # Lignite (low fuel cost, high emissions)
+    'nuclear': 10.0,    # Nuclear (low variable cost)
+    'oil': 80.0,        # Oil (expensive fuel)
+    'biomass': 40.0,    # Biomass (fuel procurement)
+    'waste': 20.0,      # Waste to energy
+    'geothermal': 5.0,  # Geothermal (low variable cost)
+    'other': 50.0,
+}
+
+# Default efficiencies by fuel type
+DEFAULT_EFFICIENCIES = {
+    'wind': 1.0,        # Renewable: efficiency = 1 (capacity factor in p_max_pu)
+    'solar': 1.0,
+    'hydro': 0.9,
+    'gas': 0.55,        # Combined cycle gas turbine
+    'hard coal': 0.40,
+    'lignite': 0.38,
+    'nuclear': 0.33,
+    'oil': 0.35,
+    'biomass': 0.35,
+    'waste': 0.25,
+    'geothermal': 0.20,
+    'other': 0.35,
+}
+
+
+def _map_generators_to_buses(
+    generators: pd.DataFrame,
+    buses: pd.DataFrame,
+    lat_col: str = 'lat',
+    lon_col: str = 'lon'
+) -> pd.DataFrame:
+    """
+    Map generators to the nearest bus based on geographic coordinates.
+    
+    Parameters
+    ----------
+    generators : pd.DataFrame
+        Generator data with lat/lon columns
+    buses : pd.DataFrame  
+        Bus data with x (lon) and y (lat) columns
+    lat_col : str
+        Name of latitude column in generators
+    lon_col : str
+        Name of longitude column in generators
+        
+    Returns
+    -------
+    pd.DataFrame
+        Generators with added 'bus' column
+    """
+    logger.info(f"Mapping {len(generators)} generators to {len(buses)} buses...")
+    
+    result = generators.copy()
+    
+    # Filter generators with valid coordinates
+    valid_coords = result[[lat_col, lon_col]].notna().all(axis=1)
+    result_valid = result[valid_coords].copy()
+    result_invalid = result[~valid_coords].copy()
+    
+    if len(result_invalid) > 0:
+        logger.warning(f"{len(result_invalid)} generators have missing coordinates")
+    
+    if len(result_valid) == 0:
+        result['bus'] = None
+        return result
+    
+    # Create arrays for distance calculation
+    gen_coords = result_valid[[lat_col, lon_col]].values
+    bus_coords = buses[['y', 'x']].values  # y=lat, x=lon
+    bus_ids = buses.index.values
+    
+    # Find nearest bus for each generator using vectorized calculation
+    def haversine_distance(lat1, lon1, lat2, lon2):
+        """Calculate haversine distance in km."""
+        R = 6371  # Earth radius in km
+        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+        c = 2 * np.arcsin(np.sqrt(a))
+        return R * c
+    
+    nearest_buses = []
+    for gen_lat, gen_lon in gen_coords:
+        distances = haversine_distance(gen_lat, gen_lon, bus_coords[:, 0], bus_coords[:, 1])
+        nearest_idx = np.argmin(distances)
+        nearest_buses.append(bus_ids[nearest_idx])
+    
+    result_valid['bus'] = nearest_buses
+    
+    # Combine back with invalid generators
+    result = pd.concat([result_valid, result_invalid], ignore_index=True)
+    
+    assigned = result['bus'].notna().sum()
+    logger.info(f"Assigned {assigned}/{len(generators)} generators to buses")
+    
+    return result
+
+
+def prepare_generator_data(
+    generators_raw: pd.DataFrame,
+    network_buses: pd.DataFrame,
+    capacity_col: str = 'Capacity',
+    fueltype_col: str = 'Fueltype',
+    technology_col: str = 'Technology',
+    lat_col: str = 'lat',
+    lon_col: str = 'lon',
+    name_col: str = 'Name',
+    efficiency_col: str = 'Efficiency',
+    countries: list | None = None
+) -> pd.DataFrame:
+    """
+    Prepare generator data for addition to PyPSA network.
+    
+    This function:
+    1. Filters generators by country (if specified)
+    2. Maps fuel types to carriers
+    3. Assigns generators to nearest buses
+    4. Sets default efficiencies and marginal costs
+    5. Creates unique generator names
+    
+    Parameters
+    ----------
+    generators_raw : pd.DataFrame
+        Raw generator data (e.g., from powerplants.csv)
+    network_buses : pd.DataFrame
+        Bus DataFrame from the PyPSA network (n.buses)
+    capacity_col : str
+        Column name for capacity (MW)
+    fueltype_col : str
+        Column name for fuel type
+    technology_col : str
+        Column name for technology
+    lat_col : str
+        Column name for latitude
+    lon_col : str
+        Column name for longitude
+    name_col : str
+        Column name for generator name
+    efficiency_col : str
+        Column name for efficiency
+    countries : list, optional
+        List of country codes to filter (e.g., ['DE', 'FR'])
+        
+    Returns
+    -------
+    pd.DataFrame
+        Prepared generator data ready for network addition
+    """
+    logger.info(f"Preparing {len(generators_raw)} generators...")
+    
+    gens = generators_raw.copy()
+    
+    # Filter by country if specified
+    if countries is not None:
+        if 'Country' in gens.columns:
+            gens = gens[gens['Country'].isin(countries)].copy()
+            logger.info(f"Filtered to {len(gens)} generators in {len(countries)} countries")
+    
+    # Filter out zero/negative capacity
+    gens = gens[gens[capacity_col] > 0].copy()
+    
+    # Map fuel types to carriers
+    gens['carrier'] = gens[fueltype_col].map(FUEL_TO_CARRIER).fillna('other')
+    
+    # Rename capacity column
+    gens['p_nom'] = gens[capacity_col]
+    
+    # Set efficiency (use provided or default by carrier)
+    if efficiency_col in gens.columns:
+        # Use provided efficiency where available, otherwise default
+        gens['efficiency'] = gens.apply(
+            lambda row: row[efficiency_col] if pd.notna(row[efficiency_col]) and row[efficiency_col] > 0
+            else DEFAULT_EFFICIENCIES.get(row['carrier'], 0.4),
+            axis=1
+        )
+    else:
+        gens['efficiency'] = gens['carrier'].map(DEFAULT_EFFICIENCIES).fillna(0.4)
+    
+    # Set marginal cost by carrier
+    gens['marginal_cost'] = gens['carrier'].map(DEFAULT_MARGINAL_COSTS).fillna(50.0)
+    
+    # Map to buses
+    gens = _map_generators_to_buses(gens, network_buses, lat_col, lon_col)
+    
+    # Filter out generators without bus assignment
+    gens = gens[gens['bus'].notna()].copy()
+    
+    # Create unique names (handle duplicates)
+    if name_col in gens.columns:
+        # Add index suffix to ensure uniqueness
+        gens['gen_name'] = gens[name_col].astype(str) + '_' + gens.index.astype(str)
+    else:
+        gens['gen_name'] = 'gen_' + gens.index.astype(str)
+    
+    # Add technology info for wind (onshore/offshore)
+    if technology_col in gens.columns:
+        gens['is_offshore'] = gens[technology_col].str.lower().str.contains('offshore', na=False)
+    else:
+        gens['is_offshore'] = False
+    
+    logger.info(f"Prepared {len(gens)} generators for network addition")
+    
+    return gens
+
+
+def add_generators_with_profiles(
+    n: pypsa.Network,
+    generators: pd.DataFrame,
+    profiles: dict | None = None,
+    name_col: str = 'gen_name',
+    bus_col: str = 'bus',
+    capacity_col: str = 'p_nom',
+    carrier_col: str = 'carrier',
+    efficiency_col: str = 'efficiency',
+    marginal_cost_col: str = 'marginal_cost'
+) -> pypsa.Network:
+    """
+    Add generators to the network, optionally with time-varying profiles.
+    
+    This is the main function for adding generators with renewable profiles.
+    For wind and solar generators, capacity factors (p_max_pu) are set from
+    the provided profiles dictionary.
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Target network to modify
+    generators : pd.DataFrame
+        Prepared generator data (from prepare_generator_data)
+    profiles : dict, optional
+        Dictionary with 'wind' and 'solar' DataFrames containing capacity factors.
+        Each DataFrame has timestamps as index and generator names as columns.
+        If None, renewable generators are added with p_max_pu = 1.0
+    name_col : str
+        Column name for generator name (used as index)
+    bus_col : str
+        Column name for bus assignment
+    capacity_col : str
+        Column name for nominal capacity (MW)
+    carrier_col : str
+        Column name for carrier type
+    efficiency_col : str
+        Column name for efficiency
+    marginal_cost_col : str
+        Column name for marginal cost
+        
+    Returns
+    -------
+    pypsa.Network
+        Network with added generators
+        
+    Notes
+    -----
+    - Wind and solar generators get p_max_pu time series from profiles
+    - Conventional generators get p_max_pu = 1.0 (always available)
+    - Missing profiles result in p_max_pu = 0.0 (unavailable)
+    """
+    logger.info(f"Adding {len(generators)} generators to network...")
+    
+    # Ensure snapshots are set
+    if len(n.snapshots) == 0:
+        logger.error("Network has no snapshots set. Please set snapshots before adding generators.")
+        return n
+    
+    # Track statistics
+    added_count = 0
+    error_count = 0
+    profile_count = 0
+    
+    for idx, gen in generators.iterrows():
+        try:
+            gen_name = str(gen[name_col])
+            bus = str(gen[bus_col])
+            p_nom = float(gen[capacity_col])
+            carrier = str(gen[carrier_col])
+            efficiency = float(gen.get(efficiency_col, 0.4))
+            marginal_cost = float(gen.get(marginal_cost_col, 50.0))
+            
+            # Skip if bus doesn't exist in network
+            if bus not in n.buses.index:
+                logger.warning(f"Bus {bus} not in network, skipping generator {gen_name}")
+                error_count += 1
+                continue
+            
+            # Add generator
+            n.add(
+                "Generator",
+                name=gen_name,
+                bus=bus,
+                p_nom=p_nom,
+                carrier=carrier,
+                efficiency=efficiency,
+                marginal_cost=marginal_cost,
+            )
+            added_count += 1
+            
+            # Add time-varying profile for renewables
+            if profiles is not None and carrier in ['wind', 'solar']:
+                profile_df = profiles.get(carrier, pd.DataFrame())
+                
+                # Try to find matching profile column
+                profile_col = None
+                original_name = gen.get('Name', gen_name)
+                
+                # Check various possible column names
+                for candidate in [gen_name, original_name, str(original_name)]:
+                    if candidate in profile_df.columns:
+                        profile_col = candidate
+                        break
+                
+                if profile_col is not None:
+                    # Align profile to network snapshots
+                    profile_series = profile_df[profile_col]
+                    profile_aligned = profile_series.reindex(n.snapshots).fillna(0.0)
+                    n.generators_t.p_max_pu[gen_name] = profile_aligned.values
+                    profile_count += 1
+                else:
+                    # No profile found - set to 0 (conservative)
+                    logger.debug(f"No profile found for {gen_name}, setting p_max_pu=0")
+                    n.generators_t.p_max_pu[gen_name] = 0.0
+                    
+        except Exception as e:
+            error_count += 1
+            if error_count <= 5:
+                logger.error(f"Error adding generator {gen.get(name_col, idx)}: {e}")
+    
+    logger.info(f"Added {added_count} generators ({profile_count} with time-varying profiles)")
+    if error_count > 0:
+        logger.warning(f"{error_count} generators failed to add")
+    
+    return n
+
+
+def add_renewable_generators_aggregated(
+    n: pypsa.Network,
+    generators: pd.DataFrame,
+    profiles: dict,
+    carrier: str,
+    name_col: str = 'gen_name',
+    bus_col: str = 'bus',
+    capacity_col: str = 'p_nom',
+    aggregate_to_bus: bool = True
+) -> pypsa.Network:
+    """
+    Add renewable generators with bus-level aggregation.
+    
+    Instead of adding individual generators, this function aggregates
+    capacity per bus and uses a capacity-weighted average profile.
+    This reduces model size while preserving aggregate behavior.
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Target network
+    generators : pd.DataFrame
+        Generator data filtered for specific carrier
+    profiles : dict
+        Profiles dictionary with carrier key
+    carrier : str
+        Carrier type ('wind' or 'solar')
+    name_col : str
+        Column for generator names
+    bus_col : str
+        Column for bus assignments
+    capacity_col : str
+        Column for capacity
+    aggregate_to_bus : bool
+        If True, aggregate to bus level; if False, add individual generators
+        
+    Returns
+    -------
+    pypsa.Network
+        Network with added generators
+    """
+    if not aggregate_to_bus:
+        return add_generators_with_profiles(n, generators, profiles, name_col, bus_col, capacity_col)
+    
+    logger.info(f"Adding aggregated {carrier} generators...")
+    
+    profile_df = profiles.get(carrier, pd.DataFrame())
+    if profile_df.empty:
+        logger.warning(f"No profiles available for {carrier}")
+        return n
+    
+    # Group by bus
+    bus_groups = generators.groupby(bus_col)
+    
+    added = 0
+    for bus, group in bus_groups:
+        if bus not in n.buses.index:
+            continue
+        
+        # Aggregate capacity
+        total_capacity = group[capacity_col].sum()
+        
+        # Calculate capacity-weighted average profile
+        capacities = group[capacity_col].values
+        weights = capacities / capacities.sum()
+        
+        profile_cols = []
+        for idx, gen in group.iterrows():
+            gen_name = gen[name_col]
+            original_name = gen.get('Name', gen_name)
+            
+            # Find matching profile column
+            for candidate in [gen_name, original_name, str(original_name)]:
+                if candidate in profile_df.columns:
+                    profile_cols.append(profile_df[candidate])
+                    break
+            else:
+                # No profile - assume zeros
+                profile_cols.append(pd.Series(0.0, index=profile_df.index))
+        
+        if profile_cols:
+            # Stack profiles and compute weighted average
+            profiles_array = np.column_stack([p.values for p in profile_cols])
+            weighted_profile = (profiles_array * weights).sum(axis=1)
+        else:
+            weighted_profile = np.zeros(len(profile_df))
+        
+        # Add aggregated generator
+        agg_name = f"{carrier}_{bus}"
+        n.add(
+            "Generator",
+            name=agg_name,
+            bus=bus,
+            p_nom=total_capacity,
+            carrier=carrier,
+            marginal_cost=DEFAULT_MARGINAL_COSTS.get(carrier, 0.0),
+        )
+        
+        # Assign profile
+        profile_aligned = pd.Series(weighted_profile, index=profile_df.index)
+        profile_aligned = profile_aligned.reindex(n.snapshots).fillna(0.0)
+        n.generators_t.p_max_pu[agg_name] = profile_aligned.values
+        added += 1
+    
+    logger.info(f"Added {added} aggregated {carrier} generators")
+    return n
+
+
 def build_network_from_serialized_source(n: pypsa.Network, source_path: str, options: Dict[str, Any] | None = None) -> pypsa.Network:
     """
     Convenience helper: load a gzipped JSON source file and build a network.
