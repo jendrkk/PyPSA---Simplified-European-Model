@@ -111,6 +111,7 @@ def ensure_bidirectional_links(n: pypsa.Network) -> int:
     n_changed = mask_unidirectional.sum()
     
     if n_changed > 0:
+        n.links.loc[mask_unidirectional, 'efficiency'] = 1.0
         n.links.loc[mask_unidirectional, 'p_min_pu'] = -1.0
         logger.info(f"Made {n_changed} links bidirectional (p_min_pu = -1.0)")
     
@@ -437,6 +438,342 @@ def fix_post_clustering_connectivity(
     logger.info("="*60)
     
     return fixes
+
+
+# =============================================================================
+# PRE-CLUSTERING CONNECTIVITY FIXES (for network_03)
+# =============================================================================
+
+def connect_link_buses_to_grid(n: pypsa.Network) -> Dict[str, Any]:
+    """
+    Connect buses that have DC links but no AC line connections to the main grid.
+    
+    This function identifies buses connected only via DC links (HVDC) and adds
+    virtual LINKS (not lines!) to connect them to the nearest bus that has AC 
+    line connections. Links can connect buses of different carriers (AC/DC).
+    
+    This MUST be done BEFORE clustering to ensure proper network topology.
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network to modify (in-place)
+        
+    Returns
+    -------
+    dict
+        Summary with:
+        - 'link_only_buses': number of buses found with only link connections
+        - 'virtual_links_added': list of (from_bus, to_bus, capacity) tuples
+        - 'buses_connected': number of buses connected
+    """
+    logger.info("="*60)
+    logger.info("CONNECTING LINK-ONLY BUSES TO MAIN GRID (using Links)")
+    logger.info("="*60)
+    
+    # Find buses connected via lines
+    buses_in_lines = set(n.lines.bus0) | set(n.lines.bus1)
+    all_buses = set(n.buses.index)
+    
+    # Find buses connected via links but not via lines
+    buses_in_links = set(n.links.bus0) | set(n.links.bus1)
+    link_only_buses = (buses_in_links - buses_in_lines) & all_buses
+    
+    logger.info(f"Buses in lines: {len(buses_in_lines)}")
+    logger.info(f"Buses in links: {len(buses_in_links)}")
+    logger.info(f"Buses with links but no lines: {len(link_only_buses)}")
+    
+    if not link_only_buses:
+        logger.info("All link buses already connected to grid via lines")
+        return {'link_only_buses': 0, 'virtual_links_added': [], 'buses_connected': 0}
+    
+    # For each link-only bus, find nearest bus that has line connections
+    virtual_links_added = []
+    grid_buses = list(buses_in_lines)
+    
+    if not grid_buses:
+        logger.warning("No buses with line connections found!")
+        return {'link_only_buses': len(link_only_buses), 'virtual_links_added': [], 'buses_connected': 0}
+    
+    # Get coordinates
+    grid_coords = n.buses.loc[grid_buses, ['x', 'y']].values
+    
+    for bus in link_only_buses:
+        bus_coord = n.buses.loc[bus, ['x', 'y']].values
+        
+        # Calculate distances to all grid buses
+        distances = np.sqrt((grid_coords[:, 0] - bus_coord[0])**2 + 
+                           (grid_coords[:, 1] - bus_coord[1])**2)
+        
+        # Find nearest grid bus
+        nearest_idx = distances.argmin()
+        nearest_bus = grid_buses[nearest_idx]
+        min_distance = distances[nearest_idx]
+        
+        # Get capacity from the link(s) connected to this bus
+        bus_links = n.links[(n.links.bus0 == bus) | (n.links.bus1 == bus)]
+        link_capacity = bus_links.p_nom.max() if len(bus_links) > 0 else 1000
+        
+        # Add virtual LINK (not line!) - links can connect different carriers (AC/DC)
+        link_name = f"{bus} Converter"
+        if link_name not in n.links.index:
+            length = max(min_distance * 111, 1)  # Convert degrees to ~km (rough)
+            capacity = link_capacity * 1.5
+            
+            n.add(
+                "Link",
+                link_name,
+                bus0=nearest_bus,  # AC grid bus
+                bus1=bus,          # Link-only bus (may be DC)
+                p_nom=capacity,
+                p_min_pu=-1,       # Bidirectional
+                efficiency=0.98,   # Small loss for virtual connection
+                carrier='DC',
+                active = True,
+                length=length,
+            )
+            virtual_links_added.append((link_name, bus, nearest_bus, capacity))
+            logger.debug(f"Added virtual link: {nearest_bus} <-> {bus} ({capacity:.0f} MW, {length:.1f} km)")
+    
+    logger.info(f"Added {len(virtual_links_added)} virtual links to connect link-only buses")
+    
+    # Log some examples
+    for link_name, bus, nearest_bus, cap in virtual_links_added[:5]:
+        logger.info(f"  {link_name}: {nearest_bus} <-> {bus} ({cap:.0f} MW)")
+    if len(virtual_links_added) > 5:
+        logger.info(f"  ... and {len(virtual_links_added) - 5} more")
+    
+    return {
+        'link_only_buses': len(link_only_buses),
+        'virtual_links_added': (virtual_links_added),
+        'buses_connected': len(virtual_links_added)
+    }
+
+
+def make_links_bidirectional(n: pypsa.Network) -> int:
+    """
+    Make all DC links bidirectional by setting p_min_pu = -1.0.
+    
+    This is a simplification assumption that all HVDC links can transfer
+    power in both directions, which is standard for modern VSC-HVDC.
+    
+    Should be called BEFORE clustering for proper connectivity analysis.
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network to modify (in-place)
+        
+    Returns
+    -------
+    int
+        Number of links changed
+    """
+    return ensure_bidirectional_links(n)
+
+
+def remove_disconnected_buses(
+    n: pypsa.Network,
+    redistribute_loads: bool = True
+) -> Dict[str, Any]:
+    """
+    Remove buses that are completely disconnected from the network.
+    
+    A bus is considered disconnected if it has no connections via lines or links.
+    Optionally redistributes loads/generators to nearest connected bus.
+    
+    Should be called AFTER clustering.
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network to modify (in-place)
+    redistribute_loads : bool
+        If True, move loads/generators to nearest connected bus before removal
+        
+    Returns
+    -------
+    dict
+        Summary with:
+        - 'disconnected_buses': list of removed bus names
+        - 'loads_redistributed': number of loads moved
+        - 'generators_redistributed': number of generators moved
+    """
+    logger.info("="*60)
+    logger.info("REMOVING DISCONNECTED BUSES")
+    logger.info("="*60)
+    
+    # Find connected buses
+    buses_in_lines = set(n.lines.bus0) | set(n.lines.bus1)
+    buses_in_links = set(n.links.bus0) | set(n.links.bus1)
+    connected_buses = buses_in_lines | buses_in_links
+    
+    all_buses = set(n.buses.index)
+    disconnected = all_buses - connected_buses
+    
+    if not disconnected:
+        logger.info("No disconnected buses found")
+        return {'disconnected_buses': [], 'loads_redistributed': 0, 'generators_redistributed': 0}
+    
+    logger.info(f"Found {len(disconnected)} disconnected buses")
+    
+    loads_moved = 0
+    gens_moved = 0
+    
+    if redistribute_loads and connected_buses:
+        connected_list = list(connected_buses)
+        connected_coords = n.buses.loc[connected_list, ['x', 'y']].values
+        
+        for bus in disconnected:
+            if bus not in n.buses.index:
+                continue
+                
+            bus_coord = n.buses.loc[bus, ['x', 'y']].values
+            
+            # Find nearest connected bus
+            distances = np.sqrt((connected_coords[:, 0] - bus_coord[0])**2 + 
+                               (connected_coords[:, 1] - bus_coord[1])**2)
+            nearest_bus = connected_list[distances.argmin()]
+            
+            # Move loads
+            load_mask = n.loads.bus == bus
+            if load_mask.any():
+                n.loads.loc[load_mask, 'bus'] = nearest_bus
+                loads_moved += load_mask.sum()
+                logger.debug(f"Moved {load_mask.sum()} loads from {bus} to {nearest_bus}")
+            
+            # Move generators
+            gen_mask = n.generators.bus == bus
+            if gen_mask.any():
+                n.generators.loc[gen_mask, 'bus'] = nearest_bus
+                gens_moved += gen_mask.sum()
+                logger.debug(f"Moved {gen_mask.sum()} generators from {bus} to {nearest_bus}")
+    
+    # Remove disconnected buses
+    for bus in disconnected:
+        if bus in n.buses.index:
+            # Remove any remaining components
+            for component in ['Load', 'Generator', 'StorageUnit']:
+                mask = n.df(component).bus == bus
+                if mask.any():
+                    n.remove(component, n.df(component).index[mask])
+            n.remove("Bus", bus)
+    
+    logger.info(f"Removed {len(disconnected)} disconnected buses")
+    logger.info(f"Redistributed {loads_moved} loads and {gens_moved} generators")
+    
+    return {
+        'disconnected_buses': list(disconnected),
+        'loads_redistributed': loads_moved,
+        'generators_redistributed': gens_moved
+    }
+
+
+def add_slack_generators(
+    n: pypsa.Network,
+    marginal_cost: float = 10000.0,
+    capacity_margin: float = 1.2
+) -> Dict[str, Any]:
+    """
+    Add slack generators to buses that may have insufficient supply.
+    
+    Identifies buses connected only via links (potential import constraints)
+    and adds emergency "load shedding" generators with very high marginal cost.
+    
+    Should be called AFTER adding all generators (end of network_05).
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network to modify (in-place)
+    marginal_cost : float
+        Marginal cost for slack generators (€/MWh). Default 10000 (very expensive)
+    capacity_margin : float
+        Required capacity margin over peak demand. Default 1.2 (20% margin)
+        
+    Returns
+    -------
+    dict
+        Summary with:
+        - 'slack_generators_added': list of (bus, capacity) tuples
+        - 'total_slack_capacity': total MW of slack added
+    """
+    logger.info("="*60)
+    logger.info("ADDING SLACK GENERATORS")
+    logger.info("="*60)
+    
+    # Add load_shedding carrier if not exists
+    if 'load_shedding' not in n.carriers.index:
+        n.add("Carrier", "load_shedding", co2_emissions=0, nice_name="Load Shedding")
+    
+    # Find buses with only link connections (no lines)
+    buses_in_lines = set(n.lines.bus0) | set(n.lines.bus1)
+    buses_in_links = set(n.links.bus0) | set(n.links.bus1)
+    link_only_buses = buses_in_links - buses_in_lines
+    
+    slack_added = []
+    
+    for bus in link_only_buses:
+        # Get loads at this bus
+        bus_loads = n.loads[n.loads.bus == bus]
+        if len(bus_loads) == 0:
+            continue
+        
+        # Calculate peak demand
+        if len(n.loads_t.p_set.columns) > 0:
+            valid_loads = [l for l in bus_loads.index if l in n.loads_t.p_set.columns]
+            if valid_loads:
+                peak_demand = n.loads_t.p_set[valid_loads].sum(axis=1).max()
+            else:
+                peak_demand = bus_loads.p_set.sum()
+        else:
+            peak_demand = bus_loads.p_set.sum()
+        
+        if peak_demand <= 0:
+            continue
+        
+        # Get local generation capacity
+        bus_gens = n.generators[n.generators.bus == bus]
+        local_capacity = bus_gens.p_nom.sum() if len(bus_gens) > 0 else 0
+        
+        # Get link import capacity
+        bus_links = n.links[(n.links.bus0 == bus) | (n.links.bus1 == bus)]
+        link_capacity = bus_links.p_nom.sum() if len(bus_links) > 0 else 0
+        
+        # Check if supply is sufficient
+        total_supply = local_capacity + link_capacity
+        required_supply = peak_demand * capacity_margin
+        
+        if total_supply < required_supply:
+            slack_name = f"slack_{bus}"
+            if slack_name not in n.generators.index:
+                slack_capacity = required_supply - total_supply + 100  # Extra margin
+                n.add(
+                    "Generator",
+                    slack_name,
+                    bus=bus,
+                    p_nom=slack_capacity,
+                    marginal_cost=marginal_cost,
+                    carrier="load_shedding"
+                )
+                slack_added.append((bus, slack_capacity))
+                logger.debug(f"Added slack generator at {bus}: {slack_capacity:.1f} MW")
+    
+    total_slack = sum(cap for _, cap in slack_added)
+    
+    logger.info(f"Added {len(slack_added)} slack generators")
+    logger.info(f"Total slack capacity: {total_slack:.1f} MW")
+    
+    # Log some examples
+    for bus, cap in slack_added[:10]:
+        logger.info(f"  {bus}: {cap:.1f} MW")
+    if len(slack_added) > 10:
+        logger.info(f"  ... and {len(slack_added) - 10} more")
+    
+    return {
+        'slack_generators_added': slack_added,
+        'total_slack_capacity': total_slack
+    }
 
 
 def simplify_network_to_380(
@@ -1049,14 +1386,30 @@ def busmap_for_n_clusters(
     # Apply per country group with pandas version compatibility
     compat_kws = dict(include_groups=False) if PD_GE_2_2 else {}
     
+    # Only cluster AC buses - DC buses will get their own clusters
+    ac_buses = n.buses[n.buses.carrier == 'AC']
+    dc_buses = n.buses[n.buses.carrier == 'DC']
+    
+    if len(dc_buses) > 0:
+        logger.info(f"Excluding {len(dc_buses)} DC buses from clustering (each gets own cluster)")
+    
+    # Create busmap for AC buses only
     busmap = (
-        n.buses.groupby(["country", "sub_network"], group_keys=False)
+        ac_buses.groupby(["country", "sub_network"], group_keys=False)
         .apply(busmap_for_country, **compat_kws)
         .squeeze()
         .rename("busmap")
     )
     
-    logger.info(f"Created busmap with {busmap.nunique()} unique clusters")
+    # Add DC buses as their own clusters (each DC bus is its own cluster)
+    # This prevents carrier mismatch during aggregation
+    for i, dc_bus in enumerate(dc_buses.index):
+        country = dc_buses.loc[dc_bus, 'country']
+        sub_net = dc_buses.loc[dc_bus, 'sub_network']
+        # Create unique cluster name for DC bus
+        busmap.loc[dc_bus] = f"{country}{sub_net} DC{i}"
+    
+    logger.info(f"Created busmap with {busmap.nunique()} unique clusters (including {len(dc_buses)} DC)")
     return busmap
 
 
@@ -1090,6 +1443,14 @@ def clustering_for_n_clusters(
     if aggregation_strategies is None:
         aggregation_strategies = {}
     
+    # Default line strategies for attributes that might not agree across clusters
+    # Virtual lines (added for connectivity) may have empty type values
+    default_line_strategies = {
+        "type": lambda x: x.iloc[0] if len(x) > 0 else "",  # Take first value
+    }
+    # Merge with user-provided strategies (user strategies take precedence)
+    line_strategies = {**default_line_strategies, **aggregation_strategies.get("lines", {})}
+    
     # Remove non-standard line attributes to avoid warnings
     # PyPSA-EUR approach: these attributes are not standard for Lines
     # and cause warnings during aggregation
@@ -1113,7 +1474,7 @@ def clustering_for_n_clusters(
         n,
         busmap,
         bus_strategies=aggregation_strategies.get("buses", {}),
-        line_strategies=aggregation_strategies.get("lines", {}),
+        line_strategies=line_strategies,
         one_port_strategies=aggregation_strategies.get("one_ports", {}),
         aggregate_one_ports=aggregation_strategies.get("aggregate_one_ports", set()),
     )

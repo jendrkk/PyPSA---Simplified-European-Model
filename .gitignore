@@ -50,7 +50,8 @@ data/networks/base/
 data/atlite/
 PyPSA/
 pypsa_EUR/
-results/
+results/cache/
+results/figures/
 
 # Keep a small sample file in repo if present
 !data/sample.csv

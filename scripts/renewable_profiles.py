@@ -54,6 +54,205 @@ SOLAR_TEMP_COEFFICIENT = -0.004  # Power decrease per °C above 25°C
 # Default reference temperatures for solar (simplified)
 SOLAR_REFERENCE_TEMP = 25.0  # °C
 
+# Hydro parameters for realistic capacity factor profiles
+# Based on European hydropower characteristics
+HYDRO_BASE_CF = 0.35            # Base capacity factor (average availability)
+HYDRO_SEASONAL_AMPLITUDE = 0.15  # Seasonal variation amplitude (spring high, winter low)
+HYDRO_WEEKLY_AMPLITUDE = 0.08    # Weekly demand-following variation
+HYDRO_DAILY_AMPLITUDE = 0.05     # Daily peak/off-peak variation
+HYDRO_RANDOM_SHOCK_PROB = 0.02   # Probability of random shock per 6-hour period
+HYDRO_SHOCK_DURATION_MAX = 336   # Max shock duration in hours (2 weeks)
+HYDRO_SHOCK_MAGNITUDE_MAX = 0.25 # Max shock impact on capacity factor
+
+
+def generate_hydro_profile(
+    timestamps: pd.DatetimeIndex,
+    base_cf: float = HYDRO_BASE_CF,
+    country: Optional[str] = None,
+    seed: Optional[int] = None
+) -> pd.Series:
+    """
+    Generate realistic hydro power capacity factor time series.
+    
+    Creates a synthetic hydro profile with:
+    1. Seasonal variation (higher in spring/early summer due to snowmelt)
+    2. Weekly variation (lower on weekends, demand-following)
+    3. Daily variation (peak during day, lower at night)
+    4. Random shocks (droughts, maintenance, reservoir management)
+    
+    This creates more realistic hydro dispatch compared to treating hydro
+    as fully dispatchable, which leads to unrealistic ~50% hydro share.
+    
+    Parameters
+    ----------
+    timestamps : pd.DatetimeIndex
+        Time index for the profile
+    base_cf : float
+        Base capacity factor (default 0.35, typical for European hydro)
+    country : str, optional
+        Country code for country-specific adjustments (e.g., 'NO' for Norway)
+    seed : int, optional
+        Random seed for reproducibility
+        
+    Returns
+    -------
+    pd.Series
+        Capacity factor time series (0-1)
+        
+    Notes
+    -----
+    European hydro characteristics:
+    - Norway/Sweden: High reservoir capacity, more seasonal variation
+    - Alps (CH, AT): Strong spring snowmelt peak
+    - Spain/Portugal: Constrained by droughts in summer
+    - Run-of-river: Less seasonal, more dependent on precipitation
+    
+    Examples
+    --------
+    >>> timestamps = pd.date_range('2023-01-01', periods=8760, freq='h')
+    >>> profile = generate_hydro_profile(timestamps, base_cf=0.35)
+    >>> print(f"Mean CF: {profile.mean():.3f}, Range: {profile.min():.3f}-{profile.max():.3f}")
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    n_hours = len(timestamps)
+    
+    # 1. SEASONAL COMPONENT
+    # Peak in spring (April-June) due to snowmelt, low in late summer/winter
+    # Convert to numpy arrays to allow in-place modifications
+    day_of_year = np.array(timestamps.dayofyear)
+    # Seasonal peak around day 120 (late April/early May)
+    seasonal = HYDRO_SEASONAL_AMPLITUDE * np.sin(2 * np.pi * (day_of_year - 30) / 365)
+    
+    # Country-specific seasonal adjustments
+    if country in ['NO', 'SE', 'FI']:
+        # Nordic: stronger seasonal, peak later (snowmelt)
+        seasonal = HYDRO_SEASONAL_AMPLITUDE * 1.3 * np.sin(2 * np.pi * (day_of_year - 45) / 365)
+    elif country in ['ES', 'PT']:
+        # Iberian: lower in summer (droughts)
+        seasonal = HYDRO_SEASONAL_AMPLITUDE * np.sin(2 * np.pi * (day_of_year + 30) / 365)
+        seasonal -= 0.1 * (np.sin(2 * np.pi * (day_of_year - 200) / 365) > 0.5).astype(float)
+    elif country in ['CH', 'AT']:
+        # Alps: strong spring peak
+        seasonal = HYDRO_SEASONAL_AMPLITUDE * 1.4 * np.sin(2 * np.pi * (day_of_year - 15) / 365)
+    
+    # 2. WEEKLY COMPONENT
+    # Lower generation on weekends (demand-following for reservoir hydro)
+    # Convert to numpy array for in-place modification
+    day_of_week = np.array(timestamps.dayofweek)  # Monday=0, Sunday=6
+    weekly = HYDRO_WEEKLY_AMPLITUDE * np.cos(2 * np.pi * day_of_week / 7)
+    # Weekend dip
+    weekend_mask = day_of_week >= 5
+    weekly[weekend_mask] -= HYDRO_WEEKLY_AMPLITUDE * 0.5
+    
+    # 3. DAILY COMPONENT  
+    # Higher during peak hours (8-20), lower at night
+    # Convert to numpy array for in-place modification
+    hour_of_day = np.array(timestamps.hour)
+    daily = HYDRO_DAILY_AMPLITUDE * np.sin(2 * np.pi * (hour_of_day - 6) / 24)
+    # Clip night hours more aggressively
+    daily[hour_of_day < 6] -= HYDRO_DAILY_AMPLITUDE * 0.3
+    daily[hour_of_day > 22] -= HYDRO_DAILY_AMPLITUDE * 0.3
+    
+    # 4. RANDOM SHOCKS (every 6 hours, can last up to 2 weeks)
+    # Represents: maintenance outages, droughts, reservoir constraints
+    shocks = np.zeros(n_hours)
+    
+    # Generate potential shock starts every 6 hours
+    n_potential_shocks = n_hours // 6
+    shock_starts = np.random.random(n_potential_shocks) < HYDRO_RANDOM_SHOCK_PROB
+    
+    for i, is_shock in enumerate(shock_starts):
+        if is_shock:
+            start_hour = i * 6
+            # Duration: random 6 hours to 2 weeks
+            duration = np.random.randint(6, HYDRO_SHOCK_DURATION_MAX + 1)
+            # Magnitude: can be positive (e.g., high inflow) or negative (drought, outage)
+            magnitude = np.random.uniform(-HYDRO_SHOCK_MAGNITUDE_MAX, HYDRO_SHOCK_MAGNITUDE_MAX * 0.5)
+            
+            # Apply shock with smooth ramp-up/ramp-down (12 hours each)
+            for h in range(duration):
+                if start_hour + h >= n_hours:
+                    break
+                # Ramp factor
+                if h < 12:
+                    ramp = h / 12
+                elif h > duration - 12:
+                    ramp = (duration - h) / 12
+                else:
+                    ramp = 1.0
+                shocks[start_hour + h] += magnitude * ramp
+    
+    # 5. SMALL RANDOM NOISE (6-hourly)
+    # Represents small operational variations
+    noise = np.zeros(n_hours)
+    for i in range(0, n_hours, 6):
+        noise_val = np.random.normal(0, 0.02)
+        noise[i:min(i+6, n_hours)] = noise_val
+    
+    # COMBINE ALL COMPONENTS
+    cf = base_cf + seasonal + weekly + daily + shocks + noise
+    
+    # Ensure valid range
+    cf = np.clip(cf, 0.05, 0.95)  # Never 0 or 1 for hydro
+    
+    return pd.Series(cf, index=timestamps, name='hydro_cf')
+
+
+def generate_hydro_profiles_by_country(
+    timestamps: pd.DatetimeIndex,
+    countries: List[str],
+    base_cf: float = HYDRO_BASE_CF,
+    seed: Optional[int] = 42
+) -> pd.DataFrame:
+    """
+    Generate country-specific hydro capacity factor profiles.
+    
+    Parameters
+    ----------
+    timestamps : pd.DatetimeIndex
+        Time index for profiles
+    countries : list of str
+        List of country codes
+    base_cf : float
+        Base capacity factor
+    seed : int, optional
+        Base random seed (each country gets seed + hash(country))
+        
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with index=timestamps, columns=countries
+    """
+    profiles = pd.DataFrame(index=timestamps)
+    
+    for country in countries:
+        # Different seed per country for variation
+        country_seed = seed + hash(country) % 10000 if seed else None
+        
+        # Country-specific base CF adjustments
+        cf_adjustment = {
+            'NO': 0.10,   # Norway: very high hydro capacity factor
+            'SE': 0.05,   # Sweden: high
+            'AT': 0.05,   # Austria: Alpine hydro
+            'CH': 0.08,   # Switzerland: very high utilization
+            'ES': -0.05,  # Spain: drought constraints
+            'PT': -0.05,  # Portugal: similar to Spain
+            'IT': 0.00,   # Italy: average
+            'FR': 0.02,   # France: moderate
+            'DE': -0.02,  # Germany: limited hydro
+        }.get(country, 0.0)
+        
+        profiles[country] = generate_hydro_profile(
+            timestamps,
+            base_cf=base_cf + cf_adjustment,
+            country=country,
+            seed=country_seed
+        )
+    
+    return profiles
+
 
 def wind_power_curve(wind_speed: Union[float, np.ndarray, pd.Series]) -> Union[float, np.ndarray, pd.Series]:
     """
@@ -675,6 +874,265 @@ def aggregate_profiles_to_buses(
     
     logger.info(f"Aggregated to {len(aggregated.columns)} buses")
     return aggregated
+
+
+# =============================================================================
+# HIGH-LEVEL API FOR NOTEBOOK USE
+# =============================================================================
+
+def create_all_renewable_profiles(
+    weather_data: pd.DataFrame,
+    generators: pd.DataFrame,
+    nuts2_shapes: gpd.GeoDataFrame,
+    snapshots: pd.DatetimeIndex,
+    date_col: str = 'Date'
+) -> Dict[str, pd.DataFrame]:
+    """
+    Create all renewable capacity factor profiles from weather data.
+    
+    This is the main high-level function to use in notebooks. It:
+    1. Parses weather data into wind speed and solar radiation per NUTS-2
+    2. Converts to capacity factors using power curves
+    3. Assigns generators to NUTS-2 regions based on coordinates
+    4. Creates generator-specific profiles aligned to network snapshots
+    
+    Parameters
+    ----------
+    weather_data : pd.DataFrame
+        Weather data with columns: Date, ws_<NUTS2> (wind speed), rad_<NUTS2> (radiation)
+    generators : pd.DataFrame
+        Prepared generator data with lat, lon, gen_name, carrier columns
+    nuts2_shapes : gpd.GeoDataFrame
+        NUTS-2 region geometries for spatial assignment
+    snapshots : pd.DatetimeIndex
+        Network snapshots to align profiles to
+    date_col : str
+        Name of date column in weather_data
+        
+    Returns
+    -------
+    Dict[str, pd.DataFrame]
+        Dictionary with keys 'wind', 'solar' containing profile DataFrames
+        Index = timestamps, columns = generator names
+        
+    Example
+    -------
+    >>> profiles = create_all_renewable_profiles(weather, gens, nuts2_shapes, n.snapshots)
+    >>> n = nw.add_generators_with_profiles(n, wind_gens, profiles)
+    """
+    logger.info("Creating all renewable capacity factor profiles...")
+    
+    # Parse weather data timestamps
+    timestamps = pd.to_datetime(weather_data[date_col])
+    
+    # Get wind and solar column lists
+    ws_cols = [c for c in weather_data.columns if c.startswith('ws_')]
+    rad_cols = [c for c in weather_data.columns if c.startswith('rad_')]
+    
+    logger.info(f"Found {len(ws_cols)} wind and {len(rad_cols)} solar NUTS-2 regions")
+    
+    # Create NUTS-2 level profiles
+    wind_profiles_nuts2 = pd.DataFrame(index=timestamps)
+    solar_profiles_nuts2 = pd.DataFrame(index=timestamps)
+    
+    for ws_col in ws_cols:
+        nuts2_id = ws_col.replace('ws_', '')
+        wind_speed = weather_data[ws_col].values
+        wind_profiles_nuts2[nuts2_id] = wind_power_curve(wind_speed)
+    
+    for rad_col in rad_cols:
+        nuts2_id = rad_col.replace('rad_', '')
+        irradiance = weather_data[rad_col].values
+        solar_profiles_nuts2[nuts2_id] = solar_capacity_factor(irradiance)
+    
+    logger.info(f"Wind CF: mean={wind_profiles_nuts2.mean().mean():.3f}")
+    logger.info(f"Solar CF: mean={solar_profiles_nuts2.mean().mean():.3f}")
+    
+    # Filter generators by carrier
+    wind_gens = generators[generators['carrier'] == 'wind'].copy()
+    solar_gens = generators[generators['carrier'] == 'solar'].copy()
+    
+    logger.info(f"Processing {len(wind_gens)} wind, {len(solar_gens)} solar generators")
+    
+    # Assign NUTS-2 regions if not already done
+    if 'nuts2_id' not in wind_gens.columns or wind_gens['nuts2_id'].isna().all():
+        wind_gens = assign_generators_to_nuts2(wind_gens, nuts2_shapes)
+    if 'nuts2_id' not in solar_gens.columns or solar_gens['nuts2_id'].isna().all():
+        solar_gens = assign_generators_to_nuts2(solar_gens, nuts2_shapes)
+    
+    # Create generator-specific profiles
+    gen_wind_profiles = pd.DataFrame(index=timestamps)
+    gen_solar_profiles = pd.DataFrame(index=timestamps)
+    
+    # Wind profiles (with offshore enhancement)
+    for idx, gen in wind_gens.iterrows():
+        gen_name = gen.get('gen_name', f'wind_{idx}')
+        nuts2_id = gen.get('nuts2_id')
+        is_offshore = gen.get('is_offshore', False)
+        
+        if nuts2_id and nuts2_id in wind_profiles_nuts2.columns:
+            if is_offshore:
+                # Apply offshore enhancement
+                ws_col = f'ws_{nuts2_id}'
+                if ws_col in weather_data.columns:
+                    enhanced_ws = weather_data[ws_col].values * OFFSHORE_WIND_FACTOR
+                    profile = pd.Series(wind_power_curve(enhanced_ws), index=timestamps)
+                else:
+                    profile = wind_profiles_nuts2[nuts2_id] * 1.1
+            else:
+                profile = wind_profiles_nuts2[nuts2_id]
+            gen_wind_profiles[gen_name] = profile
+        else:
+            gen_wind_profiles[gen_name] = wind_profiles_nuts2.mean(axis=1)
+    
+    # Solar profiles
+    for idx, gen in solar_gens.iterrows():
+        gen_name = gen.get('gen_name', f'solar_{idx}')
+        nuts2_id = gen.get('nuts2_id')
+        
+        if nuts2_id and nuts2_id in solar_profiles_nuts2.columns:
+            gen_solar_profiles[gen_name] = solar_profiles_nuts2[nuts2_id]
+        else:
+            gen_solar_profiles[gen_name] = solar_profiles_nuts2.mean(axis=1)
+    
+    # Align to network snapshots
+    gen_wind_profiles = gen_wind_profiles.reindex(snapshots).fillna(method='ffill').fillna(0)
+    gen_solar_profiles = gen_solar_profiles.reindex(snapshots).fillna(method='ffill').fillna(0)
+    
+    logger.info(f"Created profiles: wind={gen_wind_profiles.shape}, solar={gen_solar_profiles.shape}")
+    
+    return {
+        'wind': gen_wind_profiles,
+        'solar': gen_solar_profiles,
+        'wind_nuts2': wind_profiles_nuts2,
+        'solar_nuts2': solar_profiles_nuts2
+    }
+
+
+def create_hydro_profiles_for_generators(
+    hydro_generators: pd.DataFrame,
+    network_buses: pd.DataFrame,
+    snapshots: pd.DatetimeIndex,
+    base_cf: float = HYDRO_BASE_CF,
+    seed: int = 42
+) -> pd.DataFrame:
+    """
+    Create hydro capacity factor profiles for hydro generators.
+    
+    Parameters
+    ----------
+    hydro_generators : pd.DataFrame
+        Hydro generator data with 'gen_name' and 'bus' columns
+    network_buses : pd.DataFrame
+        Network buses with 'country' column
+    snapshots : pd.DatetimeIndex
+        Network snapshots
+    base_cf : float
+        Base capacity factor (default 0.35)
+    seed : int
+        Random seed for reproducibility
+        
+    Returns
+    -------
+    pd.DataFrame
+        Hydro profiles with index=snapshots, columns=generator names
+    """
+    if len(hydro_generators) == 0:
+        logger.info("No hydro generators to process")
+        return pd.DataFrame(index=snapshots)
+    
+    logger.info(f"Creating hydro profiles for {len(hydro_generators)} generators...")
+    
+    # Get countries for hydro generators
+    hydro_countries = []
+    for idx, gen in hydro_generators.iterrows():
+        bus = gen.get('bus')
+        if bus in network_buses.index:
+            country = network_buses.loc[bus, 'country']
+            hydro_countries.append(country)
+        else:
+            hydro_countries.append('DE')  # Default fallback
+    
+    unique_countries = list(set(hydro_countries))
+    logger.info(f"Hydro countries: {sorted(unique_countries)}")
+    
+    # Generate country-specific profiles
+    country_profiles = generate_hydro_profiles_by_country(
+        timestamps=snapshots,
+        countries=unique_countries,
+        base_cf=base_cf,
+        seed=seed
+    )
+    
+    # Create generator-specific profiles
+    gen_profiles = pd.DataFrame(index=snapshots)
+    
+    for i, (idx, gen) in enumerate(hydro_generators.iterrows()):
+        gen_name = gen.get('gen_name', f'hydro_{idx}')
+        country = hydro_countries[i]
+        
+        if country in country_profiles.columns:
+            gen_profiles[gen_name] = country_profiles[country]
+        else:
+            gen_profiles[gen_name] = country_profiles.mean(axis=1)
+    
+    logger.info(f"Created hydro profiles: {gen_profiles.shape}")
+    
+    return gen_profiles
+
+
+def plot_power_curves(figsize: Tuple[int, int] = (14, 5)):
+    """
+    Plot wind and solar power curves for documentation/visualization.
+    
+    Parameters
+    ----------
+    figsize : tuple
+        Figure size (width, height)
+        
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The figure object
+    """
+    import matplotlib.pyplot as plt
+    
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+    
+    # Wind power curve
+    wind_speeds = np.linspace(0, 30, 300)
+    wind_cfs = wind_power_curve(wind_speeds)
+    
+    ax1 = axes[0]
+    ax1.plot(wind_speeds, wind_cfs, 'b-', linewidth=2)
+    ax1.axvline(WIND_CUT_IN, color='g', linestyle='--', alpha=0.7, label=f'Cut-in ({WIND_CUT_IN} m/s)')
+    ax1.axvline(WIND_RATED, color='orange', linestyle='--', alpha=0.7, label=f'Rated ({WIND_RATED} m/s)')
+    ax1.axvline(WIND_CUT_OUT, color='r', linestyle='--', alpha=0.7, label=f'Cut-out ({WIND_CUT_OUT} m/s)')
+    ax1.set_xlabel('Wind Speed (m/s)', fontsize=12)
+    ax1.set_ylabel('Capacity Factor', fontsize=12)
+    ax1.set_title('Wind Power Curve', fontsize=14)
+    ax1.legend(loc='upper left')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(0, 30)
+    ax1.set_ylim(0, 1.1)
+    
+    # Solar capacity factor
+    ax2 = axes[1]
+    irradiances = np.linspace(0, 1200, 200)
+    solar_cfs = solar_capacity_factor(irradiances)
+    ax2.plot(irradiances, solar_cfs, 'orange', linewidth=2)
+    ax2.axvline(SOLAR_STC_IRRADIANCE, color='r', linestyle='--', alpha=0.7, 
+                label=f'STC ({SOLAR_STC_IRRADIANCE} W/m²)')
+    ax2.set_xlabel('Irradiance (W/m²)', fontsize=12)
+    ax2.set_ylabel('Capacity Factor', fontsize=12)
+    ax2.set_title('Solar PV Capacity Factor', fontsize=14)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlim(0, 1200)
+    ax2.set_ylim(0, 1.1)
+    
+    plt.tight_layout()
+    return fig
 
 
 if __name__ == "__main__":
