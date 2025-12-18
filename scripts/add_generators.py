@@ -94,9 +94,9 @@ except ImportError:
 
 # Default paths relative to project root
 DEFAULT_PATHS = {
-    'powerplants': 'data/processed/powerplants.csv',
+    'powerplants': 'data/raw/powerplants.csv',
     'weather': 'data/processed/weather_processed.csv.gz',
-    'nuts2_shapes': 'data/processed/nuts2_shapes.gpkg',
+    'nuts2_shapes': 'data/cache/geometry/all_nuts2.parquet',
 }
 
 # Carrier classification
@@ -250,7 +250,11 @@ def add_all_generators(
     
     # Load NUTS-2 shapes
     if nuts2_shapes_path.exists():
-        nuts2_shapes = gpd.read_file(nuts2_shapes_path)
+        # Use read_parquet for .parquet files (faster), otherwise read_file
+        if nuts2_shapes_path.suffix == '.parquet':
+            nuts2_shapes = gpd.read_parquet(nuts2_shapes_path)
+        else:
+            nuts2_shapes = gpd.read_file(nuts2_shapes_path)
         if verbose:
             logger.info(f"  Loaded {len(nuts2_shapes)} NUTS-2 regions")
     else:
@@ -258,8 +262,12 @@ def add_all_generators(
         nuts2_shapes = None
     
     # Load weather data
-    weather = pd.read_csv(weather_path, parse_dates=['timestamp'])
-    weather = weather.set_index('timestamp')
+    # Detect timestamp column name (could be 'Date' or 'timestamp')
+    weather = pd.read_csv(weather_path, nrows=1)
+    timestamp_col = 'Date' if 'Date' in weather.columns else 'timestamp'
+    
+    weather = pd.read_csv(weather_path, parse_dates=[timestamp_col])
+    weather = weather.set_index(timestamp_col)
     if verbose:
         logger.info(f"  Loaded weather data: {len(weather)} timesteps")
     

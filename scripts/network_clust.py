@@ -5,6 +5,7 @@ This module provides methods for:
 1. Simplifying networks (voltage level reduction, removing converters/stubs)
 2. Clustering networks using various algorithms (k-means, HAC, greedy modularity)
 3. Distributing clusters optimally across countries using Gurobi solver
+4. Post-clustering connectivity fixes (bidirectional links, isolated bus handling)
 
 Based on pypsa-eur methodology with adaptations for simplified European model.
 """
@@ -13,7 +14,7 @@ import logging
 import warnings
 from functools import reduce
 from pathlib import Path
-from typing import Any, Dict, Iterable, Collection
+from typing import Any, Dict, Iterable, Collection, Optional, Tuple, Set
 from packaging.version import Version, parse
 
 import numpy as np
@@ -29,7 +30,7 @@ from pypsa.clustering.spatial import (
     get_clustering_from_busmap,
     busmap_by_stubs,
 )
-from scipy.sparse.csgraph import dijkstra
+from scipy.sparse.csgraph import dijkstra, connected_components
 from shapely.geometry import Point
 
 # Configure logging
@@ -79,6 +80,363 @@ def weighting_for_country(df: pd.DataFrame, weights: pd.Series) -> pd.Series:
         logger.warning(f"All buses in group have zero weight, using uniform weights")
         return pd.Series(1, index=df.index, dtype=int)
     return (w * (100 / w.max())).clip(lower=1).astype(int)
+
+
+# =============================================================================
+# POST-CLUSTERING CONNECTIVITY FIXES
+# =============================================================================
+
+def ensure_bidirectional_links(n: pypsa.Network) -> int:
+    """
+    Ensure all links are bidirectional by setting p_min_pu = -1.0.
+    
+    Following PyPSA-EUR convention, links should allow power flow in both
+    directions (from bus0 to bus1 AND from bus1 to bus0).
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network to modify (in-place)
+        
+    Returns
+    -------
+    int
+        Number of links that were changed to bidirectional
+    """
+    if n.links.empty:
+        return 0
+    
+    # Count unidirectional links (p_min_pu >= 0)
+    mask_unidirectional = n.links['p_min_pu'] >= 0
+    n_changed = mask_unidirectional.sum()
+    
+    if n_changed > 0:
+        n.links.loc[mask_unidirectional, 'p_min_pu'] = -1.0
+        logger.info(f"Made {n_changed} links bidirectional (p_min_pu = -1.0)")
+    
+    return n_changed
+
+
+def get_connected_components(
+    n: pypsa.Network,
+    branch_components: Optional[list] = None
+) -> Tuple[int, pd.Series]:
+    """
+    Find connected components in the network.
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network to analyze
+    branch_components : list, optional
+        Branch components to consider. Default: ['Line', 'Link']
+        
+    Returns
+    -------
+    tuple
+        (n_components, component_labels) where component_labels is a Series
+        mapping bus -> component_id
+    """
+    if branch_components is None:
+        branch_components = ['Line', 'Link']
+    
+    # Build adjacency matrix
+    adj = n.adjacency_matrix(branch_components=branch_components)
+    
+    # Find connected components
+    n_comp, labels = connected_components(adj, directed=False)
+    
+    component_series = pd.Series(labels, index=n.buses.index, name='component')
+    
+    return n_comp, component_series
+
+
+def identify_isolated_buses(
+    n: pypsa.Network,
+    simplified_network: Optional[pypsa.Network] = None
+) -> Tuple[Set[str], Set[str], Set[str]]:
+    """
+    Identify isolated buses after clustering.
+    
+    Categorizes isolated buses into:
+    1. Buses that were already isolated in simplified network (remove them)
+    2. Buses that became isolated due to clustering (reconnect them)
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Clustered network to analyze
+    simplified_network : pypsa.Network, optional
+        Pre-clustering simplified network for comparison
+        
+    Returns
+    -------
+    tuple
+        (all_isolated, already_isolated, newly_isolated)
+        - all_isolated: Set of all buses not connected via lines
+        - already_isolated: Set that were isolated before clustering
+        - newly_isolated: Set that became isolated due to clustering
+    """
+    # Find buses connected via lines
+    buses_in_lines = set(n.lines.bus0) | set(n.lines.bus1)
+    all_buses = set(n.buses.index)
+    
+    # Buses not connected by any line
+    all_isolated = all_buses - buses_in_lines
+    
+    # Check which were already isolated in simplified network
+    already_isolated = set()
+    newly_isolated = set()
+    
+    if simplified_network is not None:
+        simplified_buses_in_lines = set(simplified_network.lines.bus0) | set(simplified_network.lines.bus1)
+        
+        for bus in all_isolated:
+            # Check if this bus (or its pre-clustering equivalent) was in lines
+            # Bus names might have changed during clustering, so we check by links
+            bus_links = n.links[(n.links.bus0 == bus) | (n.links.bus1 == bus)]
+            
+            if bus_links.empty:
+                # No links either - completely isolated, safe to remove
+                already_isolated.add(bus)
+            else:
+                # Has links but no lines - became isolated during clustering
+                newly_isolated.add(bus)
+    else:
+        # Without simplified network, classify by whether bus has links
+        for bus in all_isolated:
+            bus_links = n.links[(n.links.bus0 == bus) | (n.links.bus1 == bus)]
+            if bus_links.empty:
+                already_isolated.add(bus)
+            else:
+                newly_isolated.add(bus)
+    
+    logger.info(f"Isolated bus analysis:")
+    logger.info(f"  Total isolated (no lines): {len(all_isolated)}")
+    logger.info(f"  Already isolated (no links): {len(already_isolated)}")
+    logger.info(f"  Newly isolated (has links): {len(newly_isolated)}")
+    
+    return all_isolated, already_isolated, newly_isolated
+
+
+def reconnect_isolated_buses(
+    n: pypsa.Network,
+    isolated_buses: Set[str]
+) -> int:
+    """
+    Reconnect isolated buses by adding virtual lines to nearest connected bus.
+    
+    For buses that became isolated during clustering but were originally
+    connected via links, we add a virtual line with high impedance to
+    maintain connectivity while not significantly affecting power flow.
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network to modify (in-place)
+    isolated_buses : set
+        Set of bus names to reconnect
+        
+    Returns
+    -------
+    int
+        Number of buses reconnected
+    """
+    if not isolated_buses:
+        return 0
+    
+    reconnected = 0
+    buses_in_lines = set(n.lines.bus0) | set(n.lines.bus1)
+    
+    for bus in isolated_buses:
+        # Find links from this bus
+        bus_links = n.links[(n.links.bus0 == bus) | (n.links.bus1 == bus)]
+        
+        if bus_links.empty:
+            continue
+        
+        # Get the connected bus from the link (the other end)
+        for _, link in bus_links.iterrows():
+            other_bus = link.bus1 if link.bus0 == bus else link.bus0
+            
+            # If other bus is connected to lines, add a virtual line
+            if other_bus in buses_in_lines:
+                # Add a high-impedance virtual line for connectivity
+                line_name = f"virtual_{bus}_{other_bus}"
+                
+                if line_name not in n.lines.index:
+                    # Use average line parameters but with high impedance
+                    avg_s_nom = n.lines.s_nom.mean() if len(n.lines) > 0 else 1000
+                    avg_length = n.lines.length.mean() if len(n.lines) > 0 else 100
+                    
+                    n.add(
+                        "Line",
+                        line_name,
+                        bus0=bus,
+                        bus1=other_bus,
+                        s_nom=avg_s_nom,
+                        length=avg_length,
+                        x=0.01,  # Low reactance for virtual connection
+                        r=0.001,
+                        carrier='AC',
+                    )
+                    
+                    logger.debug(f"Added virtual line: {bus} <-> {other_bus}")
+                    reconnected += 1
+                    break  # One connection per isolated bus is enough
+    
+    if reconnected > 0:
+        logger.info(f"Reconnected {reconnected} isolated buses with virtual lines")
+    
+    return reconnected
+
+
+def remove_isolated_buses(
+    n: pypsa.Network,
+    buses_to_remove: Set[str],
+    redistribute_components: bool = True
+) -> int:
+    """
+    Remove isolated buses and optionally redistribute their components.
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network to modify (in-place)
+    buses_to_remove : set
+        Set of bus names to remove
+    redistribute_components : bool
+        If True, move loads/generators to nearest connected bus
+        
+    Returns
+    -------
+    int
+        Number of buses removed
+    """
+    if not buses_to_remove:
+        return 0
+    
+    # Find nearest connected bus for each isolated bus (for redistribution)
+    if redistribute_components:
+        buses_with_lines = set(n.lines.bus0) | set(n.lines.bus1)
+        connected_buses = list(buses_with_lines)
+        
+        if connected_buses:
+            # Create GeoDataFrame for spatial matching
+            bus_coords = n.buses.loc[connected_buses, ['x', 'y']]
+    
+    removed_count = 0
+    for bus in buses_to_remove:
+        if bus not in n.buses.index:
+            continue
+            
+        if redistribute_components and connected_buses:
+            # Find nearest connected bus
+            bus_loc = n.buses.loc[bus, ['x', 'y']]
+            distances = ((bus_coords['x'] - bus_loc['x'])**2 + 
+                        (bus_coords['y'] - bus_loc['y'])**2)**0.5
+            nearest_bus = distances.idxmin()
+            
+            # Move loads
+            load_mask = n.loads.bus == bus
+            if load_mask.any():
+                n.loads.loc[load_mask, 'bus'] = nearest_bus
+                logger.debug(f"Moved {load_mask.sum()} loads from {bus} to {nearest_bus}")
+            
+            # Move generators  
+            gen_mask = n.generators.bus == bus
+            if gen_mask.any():
+                n.generators.loc[gen_mask, 'bus'] = nearest_bus
+                logger.debug(f"Moved {gen_mask.sum()} generators from {bus} to {nearest_bus}")
+        
+        # Remove links connected to this bus
+        link_mask = (n.links.bus0 == bus) | (n.links.bus1 == bus)
+        if link_mask.any():
+            n.remove("Link", n.links.index[link_mask])
+        
+        # Remove the bus
+        n.remove("Bus", bus)
+        removed_count += 1
+    
+    if removed_count > 0:
+        logger.info(f"Removed {removed_count} isolated buses")
+    
+    return removed_count
+
+
+def fix_post_clustering_connectivity(
+    n: pypsa.Network,
+    simplified_network: Optional[pypsa.Network] = None,
+    remove_truly_isolated: bool = True,
+    reconnect_link_isolated: bool = True,
+    ensure_bidirectional: bool = True
+) -> Dict[str, int]:
+    """
+    Fix connectivity issues that arise from network clustering.
+    
+    This function addresses common issues:
+    1. Unidirectional links (sets p_min_pu = -1 for bidirectional flow)
+    2. Buses isolated after clustering but connected via links
+    3. Buses completely isolated (no lines or links)
+    
+    Parameters
+    ----------
+    n : pypsa.Network
+        Clustered network to fix (modified in-place)
+    simplified_network : pypsa.Network, optional
+        Pre-clustering simplified network for comparison
+    remove_truly_isolated : bool
+        Remove buses with no connections at all
+    reconnect_link_isolated : bool
+        Add virtual lines for buses connected only via links
+    ensure_bidirectional : bool
+        Make all links bidirectional
+        
+    Returns
+    -------
+    dict
+        Summary of fixes applied:
+        - 'links_made_bidirectional': number of links changed
+        - 'buses_removed': number of isolated buses removed
+        - 'buses_reconnected': number of buses reconnected via virtual lines
+    """
+    logger.info("="*60)
+    logger.info("POST-CLUSTERING CONNECTIVITY FIXES")
+    logger.info("="*60)
+    
+    fixes = {
+        'links_made_bidirectional': 0,
+        'buses_removed': 0,
+        'buses_reconnected': 0,
+    }
+    
+    # 1. Make links bidirectional
+    if ensure_bidirectional:
+        fixes['links_made_bidirectional'] = ensure_bidirectional_links(n)
+    
+    # 2. Identify isolated buses
+    all_isolated, already_isolated, newly_isolated = identify_isolated_buses(
+        n, simplified_network
+    )
+    
+    # 3. Remove truly isolated buses (no lines AND no links)
+    if remove_truly_isolated and already_isolated:
+        fixes['buses_removed'] = remove_isolated_buses(
+            n, already_isolated, redistribute_components=True
+        )
+    
+    # 4. Reconnect buses that have links but no lines
+    if reconnect_link_isolated and newly_isolated:
+        fixes['buses_reconnected'] = reconnect_isolated_buses(n, newly_isolated)
+    
+    logger.info("="*60)
+    logger.info("CONNECTIVITY FIXES COMPLETE")
+    logger.info(f"  Links made bidirectional: {fixes['links_made_bidirectional']}")
+    logger.info(f"  Isolated buses removed: {fixes['buses_removed']}")
+    logger.info(f"  Buses reconnected: {fixes['buses_reconnected']}")
+    logger.info("="*60)
+    
+    return fixes
 
 
 def simplify_network_to_380(
@@ -706,6 +1064,7 @@ def clustering_for_n_clusters(
     n: pypsa.Network,
     busmap: pd.Series,
     aggregation_strategies: dict | None = None,
+    fix_connectivity: bool = True,
 ) -> pypsa.clustering.spatial.Clustering:
     """
     Perform full network clustering based on busmap.
@@ -718,6 +1077,8 @@ def clustering_for_n_clusters(
         Mapping from buses to clusters
     aggregation_strategies : dict, optional
         Custom aggregation strategies for components
+    fix_connectivity : bool
+        Apply post-clustering connectivity fixes (bidirectional links, etc.)
         
     Returns
     -------
@@ -763,6 +1124,16 @@ def clustering_for_n_clusters(
         f"  Lines: {len(n.lines)} -> {len(clustering.n.lines)}\n"
         f"  Links: {len(n.links)} -> {len(clustering.n.links)}"
     )
+    
+    # Apply connectivity fixes
+    if fix_connectivity:
+        fix_post_clustering_connectivity(
+            clustering.n,
+            simplified_network=n,
+            remove_truly_isolated=True,
+            reconnect_link_isolated=False,  # Don't add virtual lines by default
+            ensure_bidirectional=True
+        )
     
     return clustering
 

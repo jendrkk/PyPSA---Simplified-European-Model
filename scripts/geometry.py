@@ -373,9 +373,9 @@ def download_nuts2_shapes(
         gdf['geometry'] = gdf.geometry.intersection(EUROPE_EXTREME_POINTS)
         # Remove empty geometries
         gdf = gdf[~gdf.geometry.is_empty].copy()
-        logger.info(f"Clipped to continental Europe: {len(gdf)} NUTS-3 region shapes remain")
+        logger.info(f"Clipped to continental Europe: {len(gdf)} NUTS-2 region shapes remain")
     else:
-        logger.info(f"Loaded {len(gdf)} NUTS-3 region shapes")
+        logger.info(f"Loaded {len(gdf)} NUTS-2 region shapes")
     
     return gdf
 

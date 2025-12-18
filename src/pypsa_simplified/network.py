@@ -174,6 +174,12 @@ def _prepare_transformer_add_kwargs(row: dict, ave_s_nom: float) -> dict:
 
 
 def _prepare_link_add_kwargs(row: dict, ave_p_nom: float) -> dict:
+    """
+    Prepare kwargs for adding a Link to the network.
+    
+    Links are bidirectional by default (p_min_pu=-1.0) following PyPSA-EUR convention.
+    This allows power flow in both directions up to p_nom capacity.
+    """
     try:
         p_nom_val = float(row.get("p_nom", ave_p_nom)) if pd.notna(row.get("p_nom")) else ave_p_nom
         return {
@@ -184,6 +190,7 @@ def _prepare_link_add_kwargs(row: dict, ave_p_nom: float) -> dict:
                 "bus0": row["bus0"],
                 "bus1": row["bus1"],
                 "p_nom": p_nom_val,
+                "p_min_pu": -1.0,  # Bidirectional: power can flow bus1 -> bus0
                 "efficiency": 1.0,
                 "carrier": "AC",
             },
