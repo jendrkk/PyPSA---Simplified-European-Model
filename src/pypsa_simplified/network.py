@@ -709,10 +709,31 @@ FUEL_TO_CARRIER = {
     'Nuclear': 'nuclear',
     'Oil': 'oil',
     'Bioenergy': 'biomass',
+    'Biogas': 'biogas',
+    'Solid Biomass': 'biomass',
     'Waste': 'waste',
     'Geothermal': 'geothermal',
     'Other': 'other',
 }
+
+# Country name to ISO code mapping (powerplants.csv uses full names)
+COUNTRY_NAME_TO_ISO = {
+    'Germany': 'DE', 'France': 'FR', 'Spain': 'ES', 'Italy': 'IT',
+    'United Kingdom': 'GB', 'Poland': 'PL', 'Netherlands': 'NL',
+    'Belgium': 'BE', 'Greece': 'GR', 'Portugal': 'PT', 'Sweden': 'SE',
+    'Austria': 'AT', 'Finland': 'FI', 'Denmark': 'DK', 'Norway': 'NO',
+    'Switzerland': 'CH', 'Ireland': 'IE', 'Romania': 'RO', 'Czechia': 'CZ',
+    'Czech Republic': 'CZ', 'Hungary': 'HU', 'Slovakia': 'SK', 'Bulgaria': 'BG',
+    'Croatia': 'HR', 'Slovenia': 'SI', 'Estonia': 'EE', 'Latvia': 'LV',
+    'Lithuania': 'LT', 'Luxembourg': 'LU', 'Cyprus': 'CY', 'Malta': 'MT',
+    'Ukraine': 'UA', 'Serbia': 'RS', 'Bosnia and Herzegovina': 'BA',
+    'Montenegro': 'ME', 'North Macedonia': 'MK', 'Albania': 'AL',
+    'Kosovo': 'XK', 'Moldova': 'MD', 'Belarus': 'BY', 'Turkey': 'TR',
+    'Great Britain': 'GB', 'UK': 'GB',
+}
+
+# Reverse mapping (ISO to full name)
+ISO_TO_COUNTRY_NAME = {v: k for k, v in COUNTRY_NAME_TO_ISO.items()}
 
 # Default marginal costs (€/MWh) based on fuel type
 # Can be refined with actual fuel prices
@@ -876,11 +897,23 @@ def prepare_generator_data(
     
     gens = generators_raw.copy()
     
-    # Filter by country if specified
+    # Map country names to ISO codes for filtering
+    if 'Country' in gens.columns:
+        gens['country_iso'] = gens['Country'].map(COUNTRY_NAME_TO_ISO)
+        # Keep original country name and add ISO code
+        unmapped = gens[gens['country_iso'].isna()]['Country'].unique()
+        if len(unmapped) > 0:
+            logger.warning(f"Unmapped countries: {list(unmapped)[:10]}")
+    
+    # Filter by country if specified (using ISO codes)
     if countries is not None:
-        if 'Country' in gens.columns:
-            gens = gens[gens['Country'].isin(countries)].copy()
+        if 'country_iso' in gens.columns:
+            gens = gens[gens['country_iso'].isin(countries)].copy()
             logger.info(f"Filtered to {len(gens)} generators in {len(countries)} countries")
+        elif 'Country' in gens.columns:
+            # Try direct match if ISO mapping failed
+            gens = gens[gens['Country'].isin(countries)].copy()
+            logger.info(f"Filtered to {len(gens)} generators (direct country match)")
     
     # Filter out zero/negative capacity
     gens = gens[gens[capacity_col] > 0].copy()
