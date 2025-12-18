@@ -46,6 +46,7 @@ data/raw/
 data/processed/
 data/other/
 data/cache/geometry/
+data/networks/base/
 data/atlite/
 PyPSA/
 pypsa_EUR/
