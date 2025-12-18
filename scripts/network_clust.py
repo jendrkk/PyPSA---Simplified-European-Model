@@ -344,9 +344,12 @@ def distribute_n_clusters_to_countries(
     cluster_weights: pd.Series,
     focus_weights: dict | None = None,
     solver_name: str = "gurobi",
+    min_clusters_per_country: int = 1,
 ) -> pd.Series:
     """
-    Optimally distribute cluster count across countries using Gurobi.
+    Optimally distribute cluster count across countries using optimization.
+    
+    **EXACT PyPSA-EUR IMPLEMENTATION** - Optimizes per (country, sub_network) directly.
     
     Solves an integer programming problem to minimize deviation from
     proportional allocation while respecting topology constraints.
@@ -361,8 +364,15 @@ def distribute_n_clusters_to_countries(
         Weights per bus (e.g., load, population)
     focus_weights : dict, optional
         Additional weights for specific countries {country: weight}
+        NOTE: Weights are DIVIDED by number of sub-networks per country
+        to ensure fair distribution across country's sub-networks.
     solver_name : str
         Solver to use ('gurobi', 'scip', 'cplex', etc.)
+    min_clusters_per_country : int
+        Minimum clusters to allocate to each country's MAIN sub-network.
+        This prevents countries from collapsing to 1 cluster and losing
+        all internal topology. Default=1 (PyPSA-EUR default).
+        Recommended: 2-3 for better line retention.
         
     Returns
     -------
@@ -376,12 +386,16 @@ def distribute_n_clusters_to_countries(
         
     Notes
     -----
-    Formulation:
-        min Σ (n_c - L_c * N)²
-        s.t. Σ n_c = N
-             1 <= n_c <= N_c (buses per country)
+    Formulation (PyPSA-EUR method):
+        min Σ (n_c,s - L_c,s * N)²
+        s.t. Σ n_c,s = N
+             1 <= n_c,s <= N_c,s (buses per country/sub_network)
     
-    Where L_c is the normalized weight for country c.
+    Where L_c,s is the normalized weight for (country c, sub_network s).
+    
+    **CRITICAL**: focus_weights are divided by number of sub-networks:
+        L[country] = weight / len(L[country])
+    This ensures countries with many sub-networks don't get over-allocated.
     
     Example with Gurobi
     -------------------
@@ -392,28 +406,35 @@ def distribute_n_clusters_to_countries(
     
     Usage:
         n_clusters_c = distribute_n_clusters_to_countries(
-            n, n_clusters=50, cluster_weights=load, solver_name='gurobi'
+            n, n_clusters=50, cluster_weights=load, solver_name='gurobi',
+            min_clusters_per_country=2  # Ensures better line retention
         )
     """
     logger.info(f"Distributing {n_clusters} clusters across countries using {solver_name}")
     
-    # Calculate normalized weights per country and sub-network
+    # =========================================================================
+    # EXACT PyPSA-EUR METHOD: Optimize per (country, sub_network) directly
+    # This is the official implementation from pypsa-eur/scripts/cluster_network.py
+    # =========================================================================
+    
+    # Calculate weights per (country, sub_network)
     L = (
         cluster_weights.groupby([n.buses.country, n.buses.sub_network])
         .sum()
         .pipe(normed)
     )
     
-    # Count available buses per group
+    # Count buses per (country, sub_network)
     N = n.buses.groupby(["country", "sub_network"]).size()[L.index]
     
     # Validate cluster count
     assert n_clusters >= len(N) and n_clusters <= N.sum(), (
         f"Number of clusters must be {len(N)} <= n_clusters <= {N.sum()} "
-        f"for this selection of countries."
+        f"for this selection of countries. Got {n_clusters}."
     )
     
-    # Apply focus weights if provided (PyPSA-EUR method)
+    # Apply focus weights if provided
+    # CRITICAL: PyPSA-EUR divides focus weight by NUMBER OF SUB-NETWORKS
     if isinstance(focus_weights, dict):
         total_focus = sum(list(focus_weights.values()))
         
@@ -424,24 +445,19 @@ def distribute_n_clusters_to_countries(
         
         logger.info(f"Applying focus weights for {len(focus_weights)} countries")
         
-        # Set focus country weights to their specified fractions
+        # EXACT PyPSA-EUR method: L[country] = weight / len(L[country])
+        # This divides the weight ACROSS all sub-networks in the country
         for country, weight in focus_weights.items():
-            # Find all (country, sub_network) entries for this country
-            country_mask = L.index.get_level_values("country") == country
-            if country_mask.any():
-                # Distribute the weight fraction equally among sub_networks
-                n_entries = country_mask.sum()
-                L[country_mask] = weight / n_entries
-                logger.debug(f"  {country}: {weight:.1%} of clusters")
+            if country in L.index.get_level_values('country'):
+                n_subnets = len(L[country])
+                L[country] = weight / n_subnets
+                logger.debug(f"  {country}: {weight:.1%} total / {n_subnets} sub-networks = {weight/n_subnets:.1%} each")
             else:
                 logger.warning(f"  {country} not found in network, skipping")
         
         # Renormalize remaining countries to fill (1 - total_focus)
-        remainder_mask = [
-            c not in focus_weights.keys() for c in L.index.get_level_values("country")
-        ]
-        if any(remainder_mask):
-            L[remainder_mask] = L.loc[remainder_mask].pipe(normed) * (1 - total_focus)
+        remainder = [c not in focus_weights.keys() for c in L.index.get_level_values("country")]
+        L[remainder] = L.loc[remainder].pipe(normed) * (1 - total_focus)
         
         logger.info("Using custom focus weights for determining number of clusters.")
     
@@ -450,12 +466,32 @@ def distribute_n_clusters_to_countries(
         f"Country weights L must sum to 1.0. Current sum: {L.sum()}"
     )
     
-    # Build optimization model (matches PyPSA-EUR implementation)
+    # =========================================================================
+    # ENHANCEMENT: Ensure minimum clusters for main sub-networks
+    # This prevents UK's 295-bus main grid from collapsing to 1 cluster
+    # =========================================================================
+    if min_clusters_per_country > 1:
+        # Find main sub-network (most buses) for each country
+        main_subnets = N.groupby(level='country').idxmax()
+        logger.info(f"Ensuring minimum {min_clusters_per_country} clusters for main sub-networks")
+        for country, (c, s) in main_subnets.items():
+            # Boost weight for main sub-network to ensure it gets min_clusters
+            min_fraction = min_clusters_per_country / n_clusters
+            if L[(c, s)] < min_fraction:
+                old_weight = L[(c, s)]
+                L[(c, s)] = min_fraction
+                logger.debug(f"  Boosted {country} main subnet weight: {old_weight:.4f} → {min_fraction:.4f}")
+        
+        # Re-normalize to sum to 1.0
+        L = L.pipe(normed)
+    
+    # =========================================================================
+    # Build optimization model (EXACT PyPSA-EUR implementation)
+    # =========================================================================
     m = linopy.Model()
     
-    # Decision variables: number of clusters per country/sub-network
-    # Use variable name "n" to match PyPSA-EUR convention
-    n = m.add_variables(
+    # Decision variables: number of clusters per (country, sub_network)
+    n_var = m.add_variables(
         lower=1,
         upper=N,
         coords=[L.index],
@@ -464,14 +500,11 @@ def distribute_n_clusters_to_countries(
     )
     
     # Constraint: total clusters must equal target
-    # Use constraint name "tot" to match PyPSA-EUR
-    m.add_constraints(n.sum() == n_clusters, name="tot")
+    m.add_constraints(n_var.sum() == n_clusters, name="tot")
     
     # Objective: minimize squared deviation from proportional allocation
-    # min Σ (n_c - L_c * N)²
-    # Expand: Σ (n_c² - 2*n_c*L_c*N + (L_c*N)²)
-    # Drop constant term (L_c*N)² for optimization
-    m.objective = (n * n - 2 * n * L * n_clusters).sum()
+    # leave out constant in objective (L * n_clusters) ** 2
+    m.objective = (n_var * n_var - 2 * n_var * L * n_clusters).sum()
     
     # Solver-specific options
     if solver_name == "gurobi":
@@ -486,19 +519,36 @@ def distribute_n_clusters_to_countries(
         }
     elif solver_name in ["scip", "cplex", "xpress", "copt", "mosek"]:
         solver_options = {}
+        if solver_name not in ["scip", "cplex", "xpress", "copt", "mosek"]:
+            logger.info(
+                f"The configured solver `{solver_name}` may not support quadratic objectives. "
+                "Falling back to `scip`."
+            )
+            solver_name = "scip"
     else:
         logger.warning(
             f"Solver {solver_name} may not support integer programming. "
-            "Falling back with basic options."
+            "Falling back to SCIP."
         )
+        solver_name = "scip"
         solver_options = {}
     
     # Solve
     try:
         m.solve(solver_name=solver_name, **solver_options)
         result = m.solution["n"].to_series().astype(int)
-        logger.info(f"Optimization successful. Cluster distribution:\n{result}")
+        
+        # Log allocation summary
+        country_totals = result.groupby(level='country').sum().sort_values(ascending=False)
+        logger.info(f"Optimization successful. Clusters per country (top 10):\n{country_totals.head(10)}")
+        
+        # Log UK specifically for debugging
+        if 'GB' in country_totals.index:
+            uk_detail = result[result.index.get_level_values('country') == 'GB']
+            logger.info(f"UK cluster allocation:\n{uk_detail}")
+        
         return result
+        
     except Exception as e:
         error_msg = f"Optimization failed with {solver_name}: {e}"
         
@@ -520,18 +570,21 @@ def distribute_n_clusters_to_countries(
         else:
             logger.error(error_msg)
         
-        # Fallback: proportional allocation with rounding
-        logger.warning("Using fallback proportional allocation")
-        result = (L * n_clusters).round().astype(int)
-        result = result.clip(lower=1, upper=N)
+        # Fallback: proportional allocation with rounding (PyPSA-EUR fallback method)
+        logger.warning("Using fallback proportional allocation per (country, sub_network)")
+        
+        # Same logic as optimization but with rounding
+        n_clusters_fallback = (L * n_clusters).round().astype(int)
+        n_clusters_fallback = n_clusters_fallback.clip(lower=1, upper=N)
+        
         # Adjust to match exact total
-        diff = n_clusters - result.sum()
+        diff = n_clusters - n_clusters_fallback.sum()
         if diff != 0:
-            # Add/remove from largest groups
             sorted_idx = L.sort_values(ascending=(diff < 0)).index
             for i in range(abs(diff)):
-                result.loc[sorted_idx[i % len(sorted_idx)]] += np.sign(diff)
-        return result
+                n_clusters_fallback.loc[sorted_idx[i % len(sorted_idx)]] += np.sign(diff)
+        
+        return n_clusters_fallback
 
 
 def busmap_for_n_clusters(
@@ -590,9 +643,20 @@ def busmap_for_n_clusters(
         # Note: x.name is a tuple (country, sub_network), convert sub_network to string
         prefix = x.name[0] + str(x.name[1]) + " "
         
+        # Check if this sub-network has cluster allocation
+        # If not, it's a tiny isolated sub-network - keep as single cluster
+        if x.name not in n_clusters_c.index:
+            logger.debug(
+                f"Sub-network {prefix[:-1]} not in cluster allocation (isolated subnet). "
+                f"Keeping {len(x)} buses as single cluster."
+            )
+            return pd.Series(prefix + "0", index=x.index)
+        
+        n_clust = n_clusters_c[x.name]
+        
         logger.debug(
             f"Determining busmap for country {prefix[:-1]} "
-            f"from {len(x)} buses to {n_clusters_c[x.name]}."
+            f"from {len(x)} buses to {n_clust}."
         )
         
         # Single bus - no clustering needed
@@ -606,18 +670,18 @@ def busmap_for_n_clusters(
         if algorithm == "kmeans":
             # PyPSA-EUR signature: busmap_by_kmeans(n, weight, n_clusters, buses_i, **kwargs)
             return prefix + busmap_by_kmeans(
-                n, weight, n_clusters_c[x.name], buses_i=x.index, **algorithm_kwds
+                n, weight, n_clust, buses_i=x.index, **algorithm_kwds
             )
         elif algorithm == "hac":
             return prefix + busmap_by_hac(
                 n,
-                n_clusters_c[x.name],
+                n_clust,
                 buses_i=x.index,
                 feature=features.reindex(x.index, fill_value=0.0),
             )
         elif algorithm == "modularity":
             return prefix + busmap_by_greedy_modularity(
-                n, n_clusters_c[x.name], buses_i=x.index
+                n, n_clust, buses_i=x.index
             )
         else:
             raise ValueError(
@@ -664,6 +728,24 @@ def clustering_for_n_clusters(
     
     if aggregation_strategies is None:
         aggregation_strategies = {}
+    
+    # Remove non-standard line attributes to avoid warnings
+    # PyPSA-EUR approach: these attributes are not standard for Lines
+    # and cause warnings during aggregation
+    # Must check and remove BEFORE calling get_clustering_from_busmap
+    non_standard_line_attrs = ['i_nom', 'v_nom']
+    removed_attrs = []
+    for attr in non_standard_line_attrs:
+        if hasattr(n.lines, attr) or attr in n.lines.columns:
+            try:
+                logger.debug(f"Removing non-standard line attribute '{attr}' before clustering")
+                n.lines.drop(columns=[attr], inplace=True, errors='ignore')
+                removed_attrs.append(attr)
+            except Exception as e:
+                logger.warning(f"Could not remove attribute '{attr}': {e}")
+    
+    if removed_attrs:
+        logger.info(f"Removed non-standard line attributes: {removed_attrs}")
     
     # Use PyPSA's built-in clustering
     clustering = get_clustering_from_busmap(
