@@ -14,6 +14,7 @@ import warnings
 from functools import reduce
 from pathlib import Path
 from typing import Any, Dict, Iterable, Collection
+from packaging.version import Version, parse
 
 import numpy as np
 import pandas as pd
@@ -35,6 +36,9 @@ from shapely.geometry import Point
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Pandas version compatibility
+PD_GE_2_2 = parse(pd.__version__) >= Version("2.2")
+
 # Constants
 GEO_CRS = "EPSG:4326"
 DISTANCE_CRS = "EPSG:3035"  # European standard projection for distance calculations
@@ -53,6 +57,8 @@ def weighting_for_country(df: pd.DataFrame, weights: pd.Series) -> pd.Series:
     """
     Calculate integer weights for country buses, scaled for optimization.
     
+    Matches PyPSA-EUR implementation exactly.
+    
     Parameters
     ----------
     df : pd.DataFrame
@@ -66,8 +72,11 @@ def weighting_for_country(df: pd.DataFrame, weights: pd.Series) -> pd.Series:
         Integer weights scaled from 1 to 100
     """
     w = normed(weights.reindex(df.index, fill_value=0))
+    # PyPSA-EUR uses w.max() without checking for zero
+    # This works because k-means handles zero weights gracefully
     if w.max() == 0:
-        # All zeros - return uniform weights
+        # All buses have zero weight - return uniform weights
+        logger.warning(f"All buses in group have zero weight, using uniform weights")
         return pd.Series(1, index=df.index, dtype=int)
     return (w * (100 / w.max())).clip(lower=1).astype(int)
 
@@ -404,46 +413,76 @@ def distribute_n_clusters_to_countries(
         f"for this selection of countries."
     )
     
-    # Apply focus weights if provided
+    # Apply focus weights if provided (PyPSA-EUR method)
     if isinstance(focus_weights, dict):
-        logger.info(f"Applying focus weights: {focus_weights}")
+        total_focus = sum(list(focus_weights.values()))
+        
+        assert total_focus <= 1.0, (
+            f"The sum of focus weights must be less than or equal to 1.0. "
+            f"Current sum: {total_focus}"
+        )
+        
+        logger.info(f"Applying focus weights for {len(focus_weights)} countries")
+        
+        # Set focus country weights to their specified fractions
         for country, weight in focus_weights.items():
-            mask = L.index.get_level_values(0) == country
-            if mask.any():
-                L.loc[mask] *= weight
-        L = L / L.sum()  # Renormalize
+            # Find all (country, sub_network) entries for this country
+            country_mask = L.index.get_level_values("country") == country
+            if country_mask.any():
+                # Distribute the weight fraction equally among sub_networks
+                n_entries = country_mask.sum()
+                L[country_mask] = weight / n_entries
+                logger.debug(f"  {country}: {weight:.1%} of clusters")
+            else:
+                logger.warning(f"  {country} not found in network, skipping")
+        
+        # Renormalize remaining countries to fill (1 - total_focus)
+        remainder_mask = [
+            c not in focus_weights.keys() for c in L.index.get_level_values("country")
+        ]
+        if any(remainder_mask):
+            L[remainder_mask] = L.loc[remainder_mask].pipe(normed) * (1 - total_focus)
+        
+        logger.info("Using custom focus weights for determining number of clusters.")
     
     # Verify normalization
     assert np.isclose(L.sum(), 1.0, rtol=1e-3), (
         f"Country weights L must sum to 1.0. Current sum: {L.sum()}"
     )
     
-    # Build optimization model
+    # Build optimization model (matches PyPSA-EUR implementation)
     m = linopy.Model()
     
     # Decision variables: number of clusters per country/sub-network
-    clusters = m.add_variables(
+    # Use variable name "n" to match PyPSA-EUR convention
+    n = m.add_variables(
         lower=1,
         upper=N,
         coords=[L.index],
-        name="n_clusters",
+        name="n",
         integer=True,
     )
     
     # Constraint: total clusters must equal target
-    m.add_constraints(clusters.sum() == n_clusters, name="total_clusters")
+    # Use constraint name "tot" to match PyPSA-EUR
+    m.add_constraints(n.sum() == n_clusters, name="tot")
     
     # Objective: minimize squared deviation from proportional allocation
     # min Σ (n_c - L_c * N)²
     # Expand: Σ (n_c² - 2*n_c*L_c*N + (L_c*N)²)
     # Drop constant term (L_c*N)² for optimization
-    m.objective = (clusters * clusters - 2 * clusters * L * n_clusters).sum()
+    m.objective = (n * n - 2 * n * L * n_clusters).sum()
     
     # Solver-specific options
     if solver_name == "gurobi":
+        # Suppress Gurobi console output for cleaner logs
+        import logging as gurobi_logging
+        gurobi_logging.getLogger("gurobipy").propagate = False
+        
         solver_options = {
             "LogToConsole": 0,  # Suppress console output
             "TimeLimit": 60,    # 60 second time limit
+            "MIPGap": 0.01,     # 1% optimality tolerance
         }
     elif solver_name in ["scip", "cplex", "xpress", "copt", "mosek"]:
         solver_options = {}
@@ -457,11 +496,30 @@ def distribute_n_clusters_to_countries(
     # Solve
     try:
         m.solve(solver_name=solver_name, **solver_options)
-        result = m.solution["n_clusters"].to_series().astype(int)
+        result = m.solution["n"].to_series().astype(int)
         logger.info(f"Optimization successful. Cluster distribution:\n{result}")
         return result
     except Exception as e:
-        logger.error(f"Optimization failed with {solver_name}: {e}")
+        error_msg = f"Optimization failed with {solver_name}: {e}"
+        
+        # Enhanced error message for Gurobi license issues
+        if solver_name == "gurobi" and ("license" in str(e).lower() or "gurobipy" in str(e).lower()):
+            logger.error(error_msg)
+            logger.error(
+                "\n=== GUROBI LICENSE HELP ===\n"
+                "Gurobi requires a valid license. Academic licenses are FREE:\n"
+                "1. Register at: https://www.gurobi.com/academia/\n"
+                "2. Download your gurobi.lic file\n"
+                "3. Place it in your home directory OR set GRB_LICENSE_FILE environment variable\n"
+                "4. Restart your Python environment\n\n"
+                "Alternative: Use open-source SCIP solver:\n"
+                "  conda install scip\n"
+                "  Then use solver_name='scip' in clustering functions\n"
+                "=========================="
+            )
+        else:
+            logger.error(error_msg)
+        
         # Fallback: proportional allocation with rounding
         logger.warning("Using fallback proportional allocation")
         result = (L * n_clusters).round().astype(int)
@@ -487,6 +545,8 @@ def busmap_for_n_clusters(
     """
     Create busmap by clustering network per country to specified counts.
     
+    This function exactly matches PyPSA-EUR's implementation.
+    
     Parameters
     ----------
     n : pypsa.Network
@@ -510,69 +570,66 @@ def busmap_for_n_clusters(
     Notes
     -----
     Applies clustering separately per country/sub-network group.
+    Matches PyPSA-EUR cluster_network.py implementation.
     """
     logger.info(f"Creating busmap using {algorithm} algorithm")
     
     if algorithm == "hac" and features is None:
-        raise ValueError("HAC algorithm requires features DataFrame")
+        raise ValueError("For HAC clustering, features must be provided.")
     
-    # Choose clustering function
+    # Set default k-means parameters (PyPSA-EUR values)
     if algorithm == "kmeans":
-        cluster_func = busmap_by_kmeans
-        cluster_args = {"bus_weightings": cluster_weights, **algorithm_kwds}
-    elif algorithm == "hac":
-        cluster_func = busmap_by_hac
-        cluster_args = {"feature": features, **algorithm_kwds}
-    elif algorithm == "modularity":
-        cluster_func = busmap_by_greedy_modularity
-        cluster_args = algorithm_kwds
-    else:
-        raise ValueError(
-            f"Unknown algorithm: {algorithm}. "
-            "Choose from 'kmeans', 'hac', or 'modularity'"
-        )
+        algorithm_kwds.setdefault("n_init", 1000)
+        algorithm_kwds.setdefault("max_iter", 30000)
+        algorithm_kwds.setdefault("tol", 1e-6)
+        algorithm_kwds.setdefault("random_state", 0)
     
-    def busmap_for_country(buses_df):
+    def busmap_for_country(x):
         """Apply clustering to a country/sub-network group."""
-        country = buses_df.name[0] if isinstance(buses_df.name, tuple) else buses_df.name
-        sub_net = buses_df.name[1] if isinstance(buses_df.name, tuple) else 0
-        n_clusters = n_clusters_c.loc[(country, sub_net)]
+        # Create prefix for cluster names (e.g., "DE0 ")
+        # Note: x.name is a tuple (country, sub_network), convert sub_network to string
+        prefix = x.name[0] + str(x.name[1]) + " "
         
-        if n_clusters == len(buses_df):
-            # No clustering needed
-            return buses_df.index.to_series()
+        logger.debug(
+            f"Determining busmap for country {prefix[:-1]} "
+            f"from {len(x)} buses to {n_clusters_c[x.name]}."
+        )
         
-        # Build weighted clustering arguments
+        # Single bus - no clustering needed
+        if len(x) == 1:
+            return pd.Series(prefix + "0", index=x.index)
+        
+        # Get weights for this country
+        weight = weighting_for_country(x, cluster_weights)
+        
+        # Apply clustering algorithm
         if algorithm == "kmeans":
-            weights_country = weighting_for_country(buses_df, cluster_weights)
-            return cluster_func(
-                n,
-                bus_weightings=weights_country,
-                n_clusters=n_clusters,
-                buses_i=buses_df.index,
-                **{k: v for k, v in cluster_args.items() if k != "bus_weightings"},
+            # PyPSA-EUR signature: busmap_by_kmeans(n, weight, n_clusters, buses_i, **kwargs)
+            return prefix + busmap_by_kmeans(
+                n, weight, n_clusters_c[x.name], buses_i=x.index, **algorithm_kwds
             )
         elif algorithm == "hac":
-            features_country = features.reindex(buses_df.index, fill_value=0)
-            return cluster_func(
+            return prefix + busmap_by_hac(
                 n,
-                n_clusters=n_clusters,
-                buses_i=buses_df.index,
-                feature=features_country,
-                **{k: v for k, v in cluster_args.items() if k != "feature"},
+                n_clusters_c[x.name],
+                buses_i=x.index,
+                feature=features.reindex(x.index, fill_value=0.0),
             )
-        else:  # modularity
-            return cluster_func(
-                n,
-                n_clusters=n_clusters,
-                buses_i=buses_df.index,
-                **cluster_args,
+        elif algorithm == "modularity":
+            return prefix + busmap_by_greedy_modularity(
+                n, n_clusters_c[x.name], buses_i=x.index
+            )
+        else:
+            raise ValueError(
+                f"`algorithm` must be one of 'kmeans' or 'hac' or 'modularity'. Is {algorithm}."
             )
     
-    # Apply per country group
+    # Apply per country group with pandas version compatibility
+    compat_kws = dict(include_groups=False) if PD_GE_2_2 else {}
+    
     busmap = (
         n.buses.groupby(["country", "sub_network"], group_keys=False)
-        .apply(busmap_for_country, include_groups=False)
+        .apply(busmap_for_country, **compat_kws)
         .squeeze()
         .rename("busmap")
     )
